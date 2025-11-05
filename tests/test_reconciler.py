@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -263,3 +264,30 @@ def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
         ("VP2", 120, 2, 0.85, "test"),
     ]
     logger.close()
+
+
+def test_estimate_linear_mapping_theil_sen() -> None:
+    players = ["VP1"]
+    model = {"VP1": (5_000_000.0, 1.00001)}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=30)
+
+    start_ns = 3_000_000_000
+    for index in range(25):
+        t_local_ns = start_ns + index * 25_000_000
+        _inject_marker(reconciler, bridge, players, model, t_local_ns)
+
+    estimate = reconciler.estimate_linear_mapping("VP1")
+    assert estimate is not None
+    intercept_expected, slope_expected = model["VP1"]
+    assert math.isclose(estimate.slope, slope_expected, rel_tol=5e-6)
+    assert abs(estimate.intercept_ns - intercept_expected) < 200_000
+    assert estimate.sample_count >= 2
+
+    state = reconciler._player_states["VP1"]
+    assert state.samples, "expected calibration samples"
+    cutoff = state.samples[-5][2]
+    recent_estimate = reconciler.estimate_linear_mapping("VP1", since=cutoff)
+    assert recent_estimate is not None
+    assert recent_estimate.sample_count <= estimate.sample_count
