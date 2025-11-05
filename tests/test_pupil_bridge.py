@@ -1,3 +1,4 @@
+import asyncio
 import math
 import statistics
 from pathlib import Path
@@ -89,3 +90,36 @@ def test_time_sync_manager_used_for_offsets(bridge):
     # subsequent call should not error even if samples exhausted
     offset2 = pupil_bridge.estimate_time_offset("VP1")
     assert math.isclose(offset2, offset, rel_tol=1e-6)
+
+
+def test_resync_buffers_normal_events_and_emits_marker(bridge):
+    pupil_bridge, device = bridge
+    device.events.clear()
+    manager = pupil_bridge._time_sync["VP1"]  # type: ignore[attr-defined]
+
+    async def exercise() -> bool:
+        resync_task = asyncio.create_task(manager.maybe_resync(observed_drift_s=0.02))
+        await asyncio.sleep(0)
+        pupil_bridge.send_event("ui.normal", "VP1", {"seq": 1})
+        pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
+        pupil_bridge.send_event("sync.critical", "VP1", {})
+        pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
+        await resync_task
+        pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
+        dispatched_before_ready = any(
+            "ui.normal" in args[0] for args, _ in device.events
+        )
+        ready = await manager.wait_ready(
+            min_samples=3, max_rms_ns=1_000_000_000, timeout=0.2
+        )
+        assert ready is True
+        pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
+        return dispatched_before_ready
+
+    normal_before_ready = asyncio.run(exercise())
+    labels = [args[0] for args, _ in device.events]
+    assert any(label.startswith("sync.resync_marker") for label in labels)
+    assert any(label.startswith("sync.host_ns") for label in labels)
+    assert any(label.startswith("sync.critical") for label in labels)
+    assert any("ui.normal" in label for label in labels)
+    assert normal_before_ready is False

@@ -9,11 +9,46 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Protocol
 
 from .logging import get_logger
 
-__all__ = ["TimeSyncManager", "TimeSyncSampleError"]
+__all__ = [
+    "TimeSyncManager",
+    "TimeSyncSampleError",
+    "TimeSyncResyncMetrics",
+    "TimeSyncResyncObserver",
+]
+
+
+@dataclass(slots=True)
+class TimeSyncResyncMetrics:
+    """Container describing the outcome of a resynchronisation."""
+
+    duration_s: float
+    sample_count: int
+    offset_s: float
+    offset_delta_s: float
+    variance: float | None
+    success: bool
+    error: Optional[str] = None
+
+
+class TimeSyncResyncObserver(Protocol):
+    """Observer notified when the manager performs a resynchronisation."""
+
+    def on_resync_begin(self, device_id: str) -> None:  # pragma: no cover - interface
+        ...
+
+    def on_resync_complete(
+        self, device_id: str, metrics: TimeSyncResyncMetrics
+    ) -> None:  # pragma: no cover - interface
+        ...
+
+    def on_resync_wait_ready(
+        self, device_id: str, ready: bool, total_samples: int, rms_ns: float | None
+    ) -> None:  # pragma: no cover - interface
+        ...
 
 
 class TimeSyncSampleError(RuntimeError):
@@ -45,6 +80,7 @@ class TimeSyncManager:
         resync_interval_s: int = 120,
         drift_threshold_s: float = 0.005,
         logger: Optional[logging.Logger] = None,
+        resync_observer: Optional[TimeSyncResyncObserver] = None,
     ) -> None:
         self.device_id = device_id
         self._measure_fn = measure_fn
@@ -55,6 +91,8 @@ class TimeSyncManager:
         self._state = _SyncState()
         self._lock = asyncio.Lock()
         self._log = logger or get_logger(f"core.time_sync.{device_id}")
+        self._resync_observer = resync_observer
+        self._resync_pending_wait_ready = False
 
     def get_offset_s(self) -> float:
         """Return the most recent offset estimate."""
@@ -106,6 +144,8 @@ class TimeSyncManager:
             timeout,
         )
 
+        pending_resync = self._resync_pending_wait_ready
+
         while time.monotonic() < deadline:
             try:
                 samples = await self._measure_fn(self.max_samples, self.sample_timeout)
@@ -136,6 +176,9 @@ class TimeSyncManager:
                             total_samples,
                             rms_ns,
                         )
+                        if pending_resync:
+                            self._notify_resync_wait_ready(True, total_samples, rms_ns)
+                            self._resync_pending_wait_ready = False
                         return True
 
             if time.monotonic() >= deadline:
@@ -147,23 +190,65 @@ class TimeSyncManager:
             total_samples,
             "n/a" if rms_ns is None else f"{rms_ns:.0f}",
         )
+        if pending_resync:
+            self._notify_resync_wait_ready(False, total_samples, rms_ns)
+            self._resync_pending_wait_ready = False
         return False
 
     async def _sync_locked(self, *, reason: str) -> float:
+        notify_resync = reason == "resync"
+        start_perf: float | None = None
+        if notify_resync:
+            start_perf = time.perf_counter()
+            self._notify_resync_begin()
+
+        previous_offset = self._state.offset_s
+
         try:
             samples = await self._measure_fn(self.max_samples, self.sample_timeout)
         except asyncio.CancelledError:  # pragma: no cover - defensive
             raise
         except Exception as exc:  # pragma: no cover - network dependent
-            self._log.warning("time_sync device=%s reason=%s status=failed error=%s", self.device_id, reason, exc)
-            return self._state.offset_s
+            self._log.warning(
+                "time_sync device=%s reason=%s status=failed error=%s",
+                self.device_id,
+                reason,
+                exc,
+            )
+            if notify_resync:
+                duration = (time.perf_counter() - start_perf) if start_perf else 0.0
+                metrics = TimeSyncResyncMetrics(
+                    duration_s=duration,
+                    sample_count=0,
+                    offset_s=previous_offset,
+                    offset_delta_s=0.0,
+                    variance=None,
+                    success=False,
+                    error=str(exc),
+                )
+                self._notify_resync_complete(metrics)
+                self._resync_pending_wait_ready = False
+            return previous_offset
 
         filtered = [float(sample) for sample in samples if isinstance(sample, (int, float))]
         if not filtered:
             self._log.warning(
                 "time_sync device=%s reason=%s status=empty", self.device_id, reason
             )
-            return self._state.offset_s
+            if notify_resync:
+                duration = (time.perf_counter() - start_perf) if start_perf else 0.0
+                metrics = TimeSyncResyncMetrics(
+                    duration_s=duration,
+                    sample_count=0,
+                    offset_s=previous_offset,
+                    offset_delta_s=0.0,
+                    variance=None,
+                    success=False,
+                    error="empty",
+                )
+                self._notify_resync_complete(metrics)
+                self._resync_pending_wait_ready = False
+            return previous_offset
 
         offset_s = statistics.median(filtered)
         if len(filtered) >= 3:
@@ -179,6 +264,18 @@ class TimeSyncManager:
             last_sync_ts=time.monotonic(),
             sample_count=len(filtered),
         )
+        if notify_resync:
+            duration = (time.perf_counter() - start_perf) if start_perf else 0.0
+            metrics = TimeSyncResyncMetrics(
+                duration_s=duration,
+                sample_count=len(filtered),
+                offset_s=offset_s,
+                offset_delta_s=offset_s - previous_offset,
+                variance=variance,
+                success=True,
+            )
+            self._notify_resync_complete(metrics)
+            self._resync_pending_wait_ready = True
         if variance is None:
             self._log.info(
                 "time_sync device=%s offset_s=%.6f samples=%d method=median",
@@ -195,6 +292,35 @@ class TimeSyncManager:
                 variance,
             )
         return offset_s
+
+    def _notify_resync_begin(self) -> None:
+        observer = self._resync_observer
+        if observer is None:
+            return
+        try:
+            observer.on_resync_begin(self.device_id)
+        except Exception:  # pragma: no cover - defensive
+            self._log.debug("resync observer begin failed", exc_info=True)
+
+    def _notify_resync_complete(self, metrics: TimeSyncResyncMetrics) -> None:
+        observer = self._resync_observer
+        if observer is None:
+            return
+        try:
+            observer.on_resync_complete(self.device_id, metrics)
+        except Exception:  # pragma: no cover - defensive
+            self._log.debug("resync observer complete failed", exc_info=True)
+
+    def _notify_resync_wait_ready(
+        self, ready: bool, total_samples: int, rms_ns: float | None
+    ) -> None:
+        observer = self._resync_observer
+        if observer is None:
+            return
+        try:
+            observer.on_resync_wait_ready(self.device_id, ready, total_samples, rms_ns)
+        except Exception:  # pragma: no cover - defensive
+            self._log.debug("resync observer wait_ready failed", exc_info=True)
 
 
 def _biweight_midvariance(samples: list[float]) -> float:
