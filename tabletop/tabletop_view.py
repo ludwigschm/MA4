@@ -8,6 +8,7 @@ import random
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -46,7 +47,7 @@ from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
 from tabletop.engine import POINTS_PER_WIN, EventLogger
-from tabletop.sync.reconciler import TimeReconciler
+from tabletop.sync.reconciler import LinearMappingEstimate, TimeReconciler
 from metrics import create_latency_panel, default_latency_metrics
 from tabletop.utils.async_tasks import AsyncCallQueue
 from tabletop.utils.input_timing import Debouncer
@@ -88,10 +89,23 @@ class _AsyncMarkerBridge:
         async_bridge.enqueue(_dispatch)
 
 
+@dataclass(frozen=True)
+class _BlockTimeMapping:
+    intercept_ns: float
+    slope: float
+    rms_ns: float
+    median_abs_ns: float
+    sample_count: int
+
+
 class TabletopRoot(FloatLayout):
     _STATE_FIELDS = STATE_FIELD_NAMES
 
     SCALE_FACTOR = NumericProperty(0.7)
+
+    _BLOCK_CAL_MARKER_COUNT = 4
+    _BLOCK_CAL_INTERVAL_S = 1.2
+    _BLOCK_CAL_START_DELAY_S = 0.2
 
     bg_texture = ObjectProperty(None, rebind=True)
     base_width = NumericProperty(3840.0)
@@ -225,6 +239,11 @@ class TabletopRoot(FloatLayout):
             perf_logging=self.perf_logging,
         )
         self.marker_bridge: Optional[_AsyncMarkerBridge] = _AsyncMarkerBridge(self)
+        self._block_calibration_tasks: list[Any] = []
+        self._block_calibration_block: Optional[int] = None
+        self._block_calibration_since: Optional[float] = None
+        self._block_time_mapping: Dict[str, _BlockTimeMapping] = {}
+        self._block_time_mapping_block: Optional[int] = None
         if self.perf_logging:
             Clock.schedule_interval(self._log_async_metrics, 1.0)
         self._bridge: Optional["PupilBridge"] = None
@@ -723,16 +742,32 @@ class TabletopRoot(FloatLayout):
         """Resolve device time for a host timestamp if a mapping exists."""
 
         reconciler = self._time_reconciler
-        if reconciler is None:
-            return (None, False)
-        mapper = getattr(reconciler, "host_to_device_ns", None)
-        if not callable(mapper):
-            return (None, False)
-        try:
-            return mapper(player, int(host_ns))
-        except Exception:
-            log.debug("host_to_device_ns mapping failed", exc_info=True)
-            return (None, False)
+        device_ns: Optional[int] = None
+        ready = False
+        if reconciler is not None:
+            mapper = getattr(reconciler, "host_to_device_ns", None)
+            if callable(mapper):
+                try:
+                    device_ns, ready = mapper(player, int(host_ns))
+                except Exception:
+                    log.debug("host_to_device_ns mapping failed", exc_info=True)
+                    device_ns = None
+                    ready = False
+        if ready and device_ns is not None:
+            return (device_ns, True)
+
+        mapping = self._active_block_mapping(player)
+        if mapping is not None:
+            try:
+                mapped_ns = int(mapping.intercept_ns + mapping.slope * host_ns)
+            except Exception:
+                log.debug("block mapping failed for %s", player, exc_info=True)
+            else:
+                return (mapped_ns, True)
+
+        if device_ns is not None:
+            return (device_ns, ready)
+        return (None, False)
 
     def _warn_timestamp_mapping_unavailable(self) -> None:
         if self._timestamp_mapping_warned:
@@ -788,6 +823,164 @@ class TabletopRoot(FloatLayout):
             self.marker_bridge.enqueue(f"button.{button}", payload)  # enriched payload (non-blocking)
         else:
             self.send_bridge_event(f"button.{button}", payload)
+
+    # ------------------------------------------------------------------
+    def _cancel_block_calibration(self) -> None:
+        if not self._block_calibration_tasks:
+            return
+        pending = list(self._block_calibration_tasks)
+        self._block_calibration_tasks.clear()
+        for event in pending:
+            cancel = getattr(event, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    log.debug("cancel block calibration failed", exc_info=True)
+        self._block_calibration_block = None
+        self._block_calibration_since = None
+        self._block_time_mapping = {}
+        self._block_time_mapping_block = None
+
+    def _maybe_schedule_block_calibration(self) -> None:
+        block_info = self.current_block_info or {}
+        block_index = block_info.get("index") if isinstance(block_info, dict) else None
+        if block_index is None:
+            return
+        if self.round_in_block != 1:
+            return
+        players = self._bridge_ready_players()
+        if not players:
+            return
+        if (
+            self._block_calibration_block == block_index
+            and any(event is not None for event in self._block_calibration_tasks)
+        ):
+            return
+
+        self._cancel_block_calibration()
+        self._block_calibration_block = block_index
+        self._block_calibration_since = time.monotonic()
+        marker_total = max(1, int(self._BLOCK_CAL_MARKER_COUNT))
+        interval = max(1.0, float(self._BLOCK_CAL_INTERVAL_S))
+        start_delay = max(0.0, float(self._BLOCK_CAL_START_DELAY_S))
+
+        for idx in range(marker_total):
+            delay = start_delay + idx * interval
+            event = Clock.schedule_once(
+                partial(
+                    self._emit_block_calibration_marker,
+                    block_index=block_index,
+                    marker_index=idx + 1,
+                    total=marker_total,
+                ),
+                delay,
+            )
+            self._block_calibration_tasks.append(event)
+
+        finalize_delay = start_delay + marker_total * interval + max(0.5, interval * 0.25)
+        finalize_event = Clock.schedule_once(
+            partial(self._complete_block_calibration, block_index=block_index),
+            finalize_delay,
+        )
+        self._block_calibration_tasks.append(finalize_event)
+        log.info(
+            "block calibration scheduled block=%s markers=%d interval=%.2fs",
+            block_index,
+            marker_total,
+            interval,
+        )
+
+    def _emit_block_calibration_marker(
+        self,
+        _dt: float,
+        *,
+        block_index: int,
+        marker_index: int,
+        total: int,
+    ) -> None:
+        if self._block_calibration_block != block_index:
+            return
+        payload = {
+            "reason": "block_calibration",
+            "block": block_index,
+            "calibration_index": marker_index,
+            "calibration_total": total,
+        }
+        self.send_bridge_event("sync.flash_beep", payload)
+
+    def _complete_block_calibration(self, _dt: float, *, block_index: int) -> None:
+        if self._block_calibration_block not in (None, block_index):
+            return
+        self._block_calibration_tasks.clear()
+        since = self._block_calibration_since
+        self._block_calibration_block = None
+        self._block_calibration_since = None
+
+        reconciler = self._time_reconciler
+        if reconciler is None:
+            log.info("block calibration skipped (no reconciler) block=%s", block_index)
+            return
+        players = self._bridge_ready_players()
+        if not players:
+            log.info("block calibration skipped (no players) block=%s", block_index)
+            return
+
+        results: Dict[str, _BlockTimeMapping] = {}
+        for player in players:
+            estimate: Optional[LinearMappingEstimate] = None
+            try:
+                estimate = reconciler.estimate_linear_mapping(player, since=since)
+            except Exception:
+                log.debug("linear mapping estimate failed for %s", player, exc_info=True)
+            if estimate is None:
+                log.warning(
+                    "block calibration insufficient samples block=%s player=%s",
+                    block_index,
+                    player,
+                )
+                continue
+            mapping = _BlockTimeMapping(
+                intercept_ns=estimate.intercept_ns,
+                slope=estimate.slope,
+                rms_ns=estimate.rms_ns,
+                median_abs_ns=estimate.median_abs_ns,
+                sample_count=estimate.sample_count,
+            )
+            results[player] = mapping
+            log.info(
+                (
+                    "block calibration block=%s player=%s intercept_ns=%.0f "
+                    "slope=%.9f rms_ns=%.0f median_abs_ns=%.0f samples=%d"
+                ),
+                block_index,
+                player,
+                mapping.intercept_ns,
+                mapping.slope,
+                mapping.rms_ns,
+                mapping.median_abs_ns,
+                mapping.sample_count,
+            )
+
+        if results:
+            self._block_time_mapping = results
+            self._block_time_mapping_block = block_index
+        else:
+            self._block_time_mapping = {}
+            self._block_time_mapping_block = None
+
+    def _active_block_mapping(self, player: str) -> Optional[_BlockTimeMapping]:
+        block_index = None
+        info = self.current_block_info
+        if isinstance(info, dict):
+            block_index = info.get("index")
+        if block_index is None:
+            block_index = self._block_time_mapping_block
+        if block_index is None:
+            return None
+        if self._block_time_mapping_block != block_index:
+            return None
+        return self._block_time_mapping.get(player)
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -1613,6 +1806,7 @@ class TabletopRoot(FloatLayout):
         self.update_user_displays()
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
+        self._maybe_schedule_block_calibration()
 
     def refresh_center_cards(self, reveal: bool):
         if reveal:

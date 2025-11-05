@@ -19,6 +19,17 @@ from metrics.latency_metrics import LatencyMetrics
 
 log = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class LinearMappingEstimate:
+    """Result of a robust linear mapping estimate between host and device time."""
+
+    intercept_ns: float
+    slope: float
+    rms_ns: float
+    median_abs_ns: float
+    sample_count: int
+
 RECENCY_TAU_SECONDS = 180.0
 SLOPE_FREEZE_CONFIDENCE = 0.90
 SLOPE_FREEZE_PPM = 20e-6
@@ -200,6 +211,58 @@ class TimeReconciler:
 
         ready = confidence >= confidence_gate
         return (device_ns, ready)
+
+    def estimate_linear_mapping(
+        self, player: str, *, since: Optional[float] = None
+    ) -> Optional[LinearMappingEstimate]:
+        """Estimate a robust affine mapping for ``player`` using recent samples."""
+
+        with self._state_lock:
+            state = self._player_states.get(player)
+            if state is None:
+                return None
+            samples_snapshot = list(state.samples)
+
+        if not samples_snapshot:
+            return None
+
+        filtered: list[tuple[float, float]] = []
+        for host_ns, device_ns, ingest_ts, _ in samples_snapshot:
+            if since is not None and ingest_ts < since:
+                continue
+            filtered.append((float(host_ns), float(device_ns)))
+
+        count = len(filtered)
+        if count < 2:
+            return None
+
+        slopes: list[float] = []
+        for idx in range(count - 1):
+            x0, y0 = filtered[idx]
+            for jdx in range(idx + 1, count):
+                x1, y1 = filtered[jdx]
+                dx = x1 - x0
+                if dx == 0.0:
+                    continue
+                slopes.append((y1 - y0) / dx)
+
+        if not slopes:
+            return None
+
+        slope = statistics.median(slopes)
+        intercept_candidates = [y - slope * x for x, y in filtered]
+        intercept = statistics.median(intercept_candidates)
+        residuals = [y - (intercept + slope * x) for x, y in filtered]
+        rms_ns = math.sqrt(sum(res ** 2 for res in residuals) / count)
+        median_abs_ns = statistics.median([abs(res) for res in residuals])
+
+        return LinearMappingEstimate(
+            intercept_ns=float(intercept),
+            slope=float(slope),
+            rms_ns=float(rms_ns),
+            median_abs_ns=float(median_abs_ns),
+            sample_count=count,
+        )
 
     # ------------------------------------------------------------------
     def submit_marker(self, label: str, t_local_ns: int) -> None:
