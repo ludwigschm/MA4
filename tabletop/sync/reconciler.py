@@ -167,6 +167,37 @@ class TimeReconciler:
             self._worker = None
 
     # ------------------------------------------------------------------
+    def host_to_device_ns(self, player: str, host_ns: int) -> tuple[Optional[int], bool]:
+        """Map a host timestamp to the device clock for the given player.
+
+        Returns a tuple ``(device_ns, ready)`` where ``device_ns`` is ``None``
+        if the current regression model is not available.  The ``ready`` flag
+        indicates whether the current mapping has passed the dynamic
+        confidence gate and should be considered stable enough for emission.
+        """
+
+        with self._state_lock:
+            state = self._player_states.get(player)
+            if state is None:
+                return (None, False)
+            intercept = state.intercept_ns
+            slope = state.slope
+            sample_count = state.sample_count
+            confidence = state.confidence
+            confidence_gate = state.confidence_gate
+
+        if sample_count < 2:
+            return (None, False)
+
+        try:
+            device_ns = int(intercept + slope * host_ns)
+        except Exception:
+            return (None, False)
+
+        ready = confidence >= confidence_gate
+        return (device_ns, ready)
+
+    # ------------------------------------------------------------------
     def submit_marker(self, label: str, t_local_ns: int) -> None:
         self._enqueue("marker", label, int(t_local_ns))
 
