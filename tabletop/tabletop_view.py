@@ -47,6 +47,7 @@ from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
 from tabletop.engine import POINTS_PER_WIN, EventLogger
 from tabletop.sync.reconciler import TimeReconciler
+from metrics import create_latency_panel, default_latency_metrics
 from tabletop.utils.async_tasks import AsyncCallQueue
 from tabletop.utils.input_timing import Debouncer
 from tabletop.utils.runtime import (
@@ -178,6 +179,11 @@ class TabletopRoot(FloatLayout):
         self.bg_texture = resolve_background_texture()
         Window.bind(on_resize=self._on_window_resize)
         self.bind(size=self._update_scale)
+
+        self._latency_metrics = default_latency_metrics()
+        self._latency_panel = create_latency_panel(self._latency_metrics)
+        if self._latency_panel is not None:
+            self.add_widget(self._latency_panel)
 
         if state is None:
             state = TabletopState(blocks=load_blocks())
@@ -554,7 +560,11 @@ class TabletopRoot(FloatLayout):
         if event_logger is None:
             return
         try:
-            reconciler = TimeReconciler(self._bridge, event_logger)
+            reconciler = TimeReconciler(
+                self._bridge,
+                event_logger,
+                latency_metrics=self._latency_metrics,
+            )
         except Exception:
             log.exception("Zeitabgleich konnte nicht initialisiert werden")
             return

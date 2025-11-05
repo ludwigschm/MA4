@@ -15,6 +15,8 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 from tabletop.engine import EventLogger
 from tabletop.pupil_bridge import PupilBridge
 
+from metrics.latency_metrics import LatencyMetrics
+
 log = logging.getLogger(__name__)
 
 RECENCY_TAU_SECONDS = 180.0
@@ -109,6 +111,7 @@ class TimeReconciler:
         micro_refine_offset_ms: float = MICRO_REFINE_OFFSET_MS,
         marker_pair_weight: float = 2.5,
         pending_pair_limit: int = 200,
+        latency_metrics: LatencyMetrics | None = None,
     ) -> None:
         self._bridge = bridge
         self._logger = logger
@@ -138,6 +141,7 @@ class TimeReconciler:
         self._pending_pair_limit = max(1, int(pending_pair_limit))
         self._pending_device_markers: Dict[str, Dict[str, _DeviceMarkerEvent]] = {}
         self._pending_host_mirrors: Dict[str, Dict[str, _HostMirrorEvent]] = {}
+        self._latency_metrics = latency_metrics
 
     # ------------------------------------------------------------------
     @property
@@ -788,6 +792,21 @@ class TimeReconciler:
                 state = self._player_states[player]
                 state.sample_count = sample_count
                 state.last_update = time.monotonic()
+                current_intercept = state.intercept_ns
+                current_slope = state.slope
+                current_rms = state.rms_ns
+            sink = self._latency_metrics
+            if sink is not None:
+                try:
+                    sink.update_estimate(
+                        player,
+                        offset_ns=current_intercept,
+                        slope=current_slope,
+                        rms_ns=current_rms,
+                        samples=sample_count,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Latency metrics update failed", exc_info=True)
             return False
 
         metrics = self._robust_fit(samples)
@@ -858,6 +877,19 @@ class TimeReconciler:
             mapping_version = state.mapping_version
             offset_sign = state.offset_sign
             locked = state.offset_sign_locked
+
+        metrics_sink = self._latency_metrics
+        if metrics_sink is not None:
+            try:
+                metrics_sink.update_estimate(
+                    player,
+                    offset_ns=metrics.intercept_ns,
+                    slope=metrics.slope_applied,
+                    rms_ns=metrics.rms_ns,
+                    samples=sample_count,
+                )
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Latency metrics update failed", exc_info=True)
 
         weights_repr = ", ".join(f"{w:.2f}" for w in weights_last3)
         log_fn = log.info if (changed or micro_refine) else log.debug
