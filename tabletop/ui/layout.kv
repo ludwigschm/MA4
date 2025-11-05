@@ -1,0 +1,305 @@
+#:import IconButton tabletop.ui.widgets.IconButton
+#:import CardWidget tabletop.ui.widgets.CardWidget
+#:import RotatableLabel tabletop.ui.widgets.RotatableLabel
+#:import ASSETS tabletop.ui.assets.ASSETS
+
+<TabletopRoot>:
+    horizontal_offset: 0.08  # fraction of total width (≈8%)
+    canvas.before:
+        Color:
+            rgba: (1, 1, 1, 1) if root.bg_texture else (0.75, 0.75, 0.75, 1)
+        Rectangle:
+            pos: self.pos
+            size: self.size
+            texture: root.bg_texture
+
+    btn_start_p1: btn_start_p1
+    btn_start_p2: btn_start_p2
+    p1_outer: p1_outer
+    p1_inner: p1_inner
+    p2_outer: p2_outer
+    p2_inner: p2_inner
+    intro_overlay: intro_overlay
+    pause_cover: pause_cover
+    fixation_overlay: fixation_overlay
+    fixation_image: fixation_image
+    round_badge: round_badge
+
+    IconButton:
+        id: btn_start_p1
+        source_normal: ASSETS['play']['stop']
+        source_down: ASSETS['play']['live']
+        size_hint: None, None
+        size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 300 * root.scale
+
+    IconButton:
+        id: btn_start_p2
+        source_normal: ASSETS['play']['stop']
+        source_down: ASSETS['play']['live']
+        size_hint: None, None
+        size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+        pos: root.horizontal_margin_px + 120 * root.scale, root.height - 300 * root.scale - self.height
+
+    CardWidget:
+        id: p1_outer
+        size_hint: None, None
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.horizontal_margin_px + 100 * root.scale, 300 * root.scale
+
+    CardWidget:
+        id: p1_inner
+        size_hint: None, None
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.ids.p1_outer.right + 70 * root.scale, 300 * root.scale
+
+    CardWidget:
+        id: p2_outer
+        size_hint: None, None
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 100 * root.scale, root.height - 300 * root.scale - self.height
+
+    CardWidget:
+        id: p2_inner
+        size_hint: None, None
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.ids.p2_outer.x - self.width - 70 * root.scale, root.ids.p2_outer.y
+
+    IconButton:
+        id: signal_p1_low
+        source_normal: ASSETS['signal']['low']['stop']
+        source_down: ASSETS['signal']['low']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 780 * root.scale, 180 * root.scale + 820 * root.scale
+
+
+    IconButton:
+        id: signal_p1_mid
+        source_normal: ASSETS['signal']['mid']['stop']
+        source_down: ASSETS['signal']['mid']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p1_low.x, root.ids.signal_p1_low.top + 40 * root.button_scale * root.scale
+
+    IconButton:
+        id: signal_p1_high
+        source_normal: ASSETS['signal']['high']['stop']
+        source_down: ASSETS['signal']['high']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p1_mid.x, root.ids.signal_p1_mid.top + 40 * root.button_scale * root.scale
+
+    IconButton:
+        id: decision_p1_bluff
+        source_normal: ASSETS['decide']['bluff']['stop']
+        source_down: ASSETS['decide']['bluff']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p1_low.x - self.width - 60 * root.button_scale * root.scale, root.ids.signal_p1_low.y
+
+    IconButton:
+        id: decision_p1_wahr
+        source_normal: ASSETS['decide']['wahr']['stop']
+        source_down: ASSETS['decide']['wahr']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.decision_p1_bluff.x, root.ids.decision_p1_bluff.top + 40 * root.button_scale * root.scale
+
+    IconButton:
+        id: signal_p2_low
+        source_normal: ASSETS['signal']['low']['stop']
+        source_down: ASSETS['signal']['low']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.horizontal_margin_px + 780 * root.scale, root.height - 180 * root.scale - 820 * root.scale - self.height
+
+    IconButton:
+        id: signal_p2_mid
+        source_normal: ASSETS['signal']['mid']['stop']
+        source_down: ASSETS['signal']['mid']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p2_low.x, root.ids.signal_p2_low.y - root.ids.signal_p2_low.height - 40 * root.button_scale * root.scale
+
+    IconButton:
+        id: signal_p2_high
+        source_normal: ASSETS['signal']['high']['stop']
+        source_down: ASSETS['signal']['high']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p2_mid.x, root.ids.signal_p2_mid.y - root.ids.signal_p2_mid.height - 40 * root.button_scale * root.scale
+
+    IconButton:
+        id: decision_p2_bluff
+        source_normal: ASSETS['decide']['bluff']['stop']
+        source_down: ASSETS['decide']['bluff']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.signal_p2_low.right + 60 * root.button_scale * root.scale, root.ids.signal_p2_low.y
+
+    IconButton:
+        id: decision_p2_wahr
+        source_normal: ASSETS['decide']['wahr']['stop']
+        source_down: ASSETS['decide']['wahr']['live']
+        size_hint: None, None
+        size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
+        pos: root.ids.decision_p2_bluff.x, root.ids.decision_p2_bluff.y - root.ids.decision_p2_bluff.height - 40 * root.button_scale * root.scale
+
+    Image:
+        id: center_p1_card_right
+        size_hint: None, None
+        fit_mode: "contain"
+        size: 380 * root.scale, 560 * root.scale
+        pos: root.width / 2 + 45 * root.scale, root.height / 2 - self.height - 30 * root.scale
+
+    Image:
+        id: center_p1_card_left
+        size_hint: None, None
+        fit_mode: "contain"
+        size: 380 * root.scale, 560 * root.scale
+        pos: root.width / 2 - self.width - 45 * root.scale, root.height / 2 - self.height - 30 * root.scale
+
+    Image:
+        id: center_p2_card_left
+        size_hint: None, None
+        fit_mode: "contain"
+        size: 380 * root.scale, 560 * root.scale
+        pos: root.width / 2 - self.width - 45 * root.scale, root.height / 2 + 30 * root.scale
+
+    Image:
+        id: center_p2_card_right
+        size_hint: None, None
+        fit_mode: "contain"
+        size: 380 * root.scale, 560 * root.scale
+        pos: root.width / 2 + 45 * root.scale, root.height / 2 + 30 * root.scale
+
+    RotatableLabel:
+        id: user_display_p1
+        size_hint: None, None
+        size: 1042 * root.scale, 660 * root.scale
+        pos: root.width / 2 - 380 * root.scale - 45 * root.scale - 96 * root.scale, root.height / 2 - 560 * root.scale - 30 * root.scale - 40 * root.scale - self.height
+        text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
+        padding: 60 * root.scale, 40 * root.scale
+        font_size: 38.4 * root.scale if root.scale else 38.4
+        halign: 'left'
+        valign: 'top'
+        color: 1, 1, 1, 1
+        markup: True
+
+    RotatableLabel:
+        id: user_display_p2
+        size_hint: None, None
+        size: 1042 * root.scale, 660 * root.scale
+        pos: root.width / 2 - 380 * root.scale - 45 * root.scale - 96 * root.scale, root.height / 2 + 560 * root.scale + 30 * root.scale + 40 * root.scale
+        text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
+        padding: 60 * root.scale, 40 * root.scale
+        font_size: 38.4 * root.scale if root.scale else 38.4
+        halign: 'left'
+        valign: 'top'
+        color: 1, 1, 1, 1
+        markup: True
+
+    FloatLayout:
+        id: intro_overlay
+        size_hint: 1, 1
+        canvas.before:
+            Color:
+                rgba: 0.75, 0.75, 0.75, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        RotatableLabel:
+            id: intro_label_p1
+            text: '[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button'
+            halign: 'center'
+            valign: 'middle'
+            color: 0, 0, 0, 1
+            markup: True
+            size_hint: None, None
+            size: root.width * 0.6, root.height * 0.25
+            pos: root.width / 2 - self.width / 2, root.height / 2 - 120 * root.scale / 2 - self.height
+            text_size: self.width - 2 * 40 * root.scale, self.height - 2 * 40 * root.scale
+            padding: 40 * root.scale, 40 * root.scale
+            font_size: 64 * root.scale if root.scale else 64
+        RotatableLabel:
+            id: intro_label_p2
+            text: '[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button'
+            halign: 'center'
+            valign: 'middle'
+            color: 0, 0, 0, 1
+            markup: True
+            size_hint: None, None
+            size: root.width * 0.6, root.height * 0.25
+            pos: root.width / 2 - self.width / 2, root.height / 2 + 120 * root.scale / 2
+            text_size: self.width - 2 * 40 * root.scale, self.height - 2 * 40 * root.scale
+            padding: 40 * root.scale, 40 * root.scale
+            font_size: 64 * root.scale if root.scale else 64
+
+    Label:
+        id: round_badge
+        size_hint: None, None
+        size: 1400 * root.scale, 70 * root.scale
+        pos: root.width / 2 - self.width / 2, 90 * root.scale
+        font_size: 40 * root.scale if root.scale else 40
+        color: 1, 1, 1, 1
+        halign: 'center'
+        valign: 'middle'
+        text_size: self.size
+
+    FloatLayout:
+        id: pause_cover
+        size_hint: 1, 1
+        opacity: 0
+        disabled: True
+        canvas.before:
+            Color:
+                rgba: 0.75, 0.75, 0.75, 1
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        RotatableLabel:
+            id: pause_label_p1
+            size_hint: None, None
+            size: root.width * 0.8, root.height * 0.25
+            pos: root.width * 0.1, 40 * root.scale
+            halign: 'center'
+            valign: 'middle'
+            color: 0, 0, 0, 1
+            text_size: self.size
+            font_size: 56 * root.scale if root.scale else 56
+        RotatableLabel:
+            id: pause_label_p2
+            size_hint: None, None
+            size: root.width * 0.8, root.height * 0.25
+            pos: root.width * 0.1, root.height - 40 * root.scale - self.height
+            halign: 'center'
+            valign: 'middle'
+            color: 0, 0, 0, 1
+            text_size: self.size
+            font_size: 56 * root.scale if root.scale else 56
+        IconButton:
+            id: pause_btn_p1
+            source_normal: ASSETS['play']['stop']
+            source_down: ASSETS['play']['live']
+            size_hint: None, None
+            size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+            pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 300 * root.scale
+        IconButton:
+            id: pause_btn_p2
+            source_normal: ASSETS['play']['stop']
+            source_down: ASSETS['play']['live']
+            size_hint: None, None
+            size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+            pos: root.horizontal_margin_px + 120 * root.scale, root.height - 300 * root.scale - self.height
+
+    FloatLayout:
+        id: fixation_overlay
+        size_hint: 1, 1
+        opacity: 0
+        disabled: True
+        Image:
+            id: fixation_image
+            size_hint: 1, 1
+            fit_mode: "contain"
+            pos: 0, 0
