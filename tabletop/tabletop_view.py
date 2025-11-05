@@ -233,6 +233,7 @@ class TabletopRoot(FloatLayout):
         self._next_bridge_check = 0.0
         self._bridge_check_interval = 0.3
         self._sync_gate_retry: Dict[str, Any] = {}
+        self._recording_wait_warned = False
         self._time_reconciler: Optional[TimeReconciler] = None
         self._heartbeat_event: Optional[Any] = None
         self._heartbeat_interval = 30.0
@@ -839,6 +840,47 @@ class TabletopRoot(FloatLayout):
         init_round_log(self)
         self.update_role_assignments()
 
+        self._mark_bridge_dirty()
+        self._ensure_bridge_recordings(force=True)
+        if not self._recordings_ready_for_session():
+            if not self._recording_wait_warned:
+                log.warning("Session-Start verschoben (Recording nicht bereit)")
+                self._recording_wait_warned = True
+            self._schedule_sync_gate_retry(
+                "session_recording",
+                self._resume_session_start_after_recording,
+            )
+            return
+
+        self._complete_session_activation()
+
+    def _recordings_ready_for_session(self) -> bool:
+        bridge = self._bridge
+        if bridge is None:
+            return True
+
+        players = self._bridge_ready_players()
+        if not players:
+            return True
+
+        return all(player in self._bridge_recordings_active for player in players)
+
+    def _resume_session_start_after_recording(self, *_args: Any) -> None:
+        self._mark_bridge_dirty()
+        self._ensure_bridge_recordings(force=True)
+        if not self._recordings_ready_for_session():
+            log.debug("Recording weiterhin nicht bereit – Session-Start erneut verschoben")
+            self._schedule_sync_gate_retry(
+                "session_recording",
+                self._resume_session_start_after_recording,
+            )
+            return
+
+        self._complete_session_activation()
+
+    def _complete_session_activation(self) -> None:
+        self._cancel_sync_gate_retry("session_recording")
+        self._recording_wait_warned = False
         self.log_event(
             None,
             'session_start',
