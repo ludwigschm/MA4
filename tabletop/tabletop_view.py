@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -231,6 +232,7 @@ class TabletopRoot(FloatLayout):
         self._bridge_state_dirty = True
         self._next_bridge_check = 0.0
         self._bridge_check_interval = 0.3
+        self._sync_gate_retry: Dict[str, Any] = {}
         self._time_reconciler: Optional[TimeReconciler] = None
         self._heartbeat_event: Optional[Any] = None
         self._heartbeat_interval = 30.0
@@ -357,6 +359,67 @@ class TabletopRoot(FloatLayout):
                     self._bridge_players = players
 
         return [player for player in players if self._bridge.is_connected(player)]
+
+    def _cancel_sync_gate_retry(self, reason: str) -> None:
+        event = self._sync_gate_retry.pop(reason, None)
+        if event is None:
+            return
+        cancel = getattr(event, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                log.debug(
+                    "Zeitabgleich-Retry-Abbruch fehlgeschlagen reason=%s",
+                    reason,
+                    exc_info=True,
+                )
+
+    def _schedule_sync_gate_retry(
+        self,
+        reason: str,
+        callback: Callable[[], None],
+        delay: float = 2.0,
+    ) -> None:
+        self._cancel_sync_gate_retry(reason)
+
+        def _runner(_dt: float) -> None:
+            self._sync_gate_retry.pop(reason, None)
+            try:
+                callback()
+            except Exception:
+                log.warning(
+                    "Zeitabgleich-Retry fehlgeschlagen reason=%s",
+                    reason,
+                    exc_info=True,
+                )
+
+        delay = max(0.0, float(delay))
+        self._sync_gate_retry[reason] = Clock.schedule_once(_runner, delay)
+
+    def _await_time_sync_gate(self, *, reason: str) -> bool:
+        bridge = self._bridge
+        if bridge is None:
+            return True
+        wait_fn = getattr(bridge, "wait_for_time_sync_gate", None)
+        if not callable(wait_fn):
+            return True
+
+        players = self._bridge_ready_players()
+        if not players and self._bridge_players:
+            players = sorted(self._bridge_players)
+        if not players:
+            return True
+
+        for player in players:
+            if not wait_fn(player, reason=reason):
+                log.warning(
+                    "Zeitabgleich nicht stabil reason=%s player=%s",
+                    reason,
+                    player,
+                )
+                return False
+        return True
 
     def _current_bridge_block_index(self) -> Optional[int]:
         block_info = self.current_block_info
@@ -692,6 +755,21 @@ class TabletopRoot(FloatLayout):
     ) -> None:
         if not session_label:
             return
+
+        if not self._await_time_sync_gate(reason="session_start"):
+            log.warning("Session-Start verschoben (Zeitabgleich nicht bereit)")
+            self._schedule_sync_gate_retry(
+                "session_start",
+                partial(
+                    self._finalize_session_setup,
+                    session_label,
+                    start_block_value=start_block_value,
+                    aruco_enabled=aruco_enabled,
+                ),
+            )
+            return
+
+        self._cancel_sync_gate_retry("session_start")
 
         self.session_id = session_label
         digits = ''.join(ch for ch in session_label if ch.isdigit())
@@ -1969,6 +2047,12 @@ class TabletopRoot(FloatLayout):
         self.reset_ui_for_new_block()
 
     def reset_ui_for_new_block(self):
+        if not self._await_time_sync_gate(reason="round_start"):
+            log.warning("Rundenstart verschoben (Zeitabgleich nicht bereit)")
+            self._schedule_sync_gate_retry("round_start", self.reset_ui_for_new_block)
+            return
+
+        self._cancel_sync_gate_retry("round_start")
         self.setup_round()
         self.apply_phase()
         self.update_user_displays()

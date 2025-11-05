@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import statistics
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -79,6 +81,73 @@ class TimeSyncManager:
                 if observed_drift_s is None or abs(observed_drift_s) <= self.drift_threshold_s:
                     return state.offset_s
             return await self._sync_locked(reason="resync")
+
+    async def wait_ready(
+        self,
+        min_samples: int = 60,
+        max_rms_ns: int = 2_000_000,
+        timeout: float = 5.0,
+    ) -> bool:
+        """Wait until enough samples have low RMS error."""
+
+        min_samples = max(1, int(min_samples))
+        max_rms_ns = int(max_rms_ns)
+        timeout = float(timeout)
+        deadline = time.monotonic() + timeout
+        window: deque[float] = deque(maxlen=min_samples)
+        total_samples = 0
+        rms_ns: float | None = None
+
+        self._log.info(
+            "time_sync device=%s action=wait_ready status=begin min_samples=%d max_rms_ns=%d timeout=%.2f",
+            self.device_id,
+            min_samples,
+            max_rms_ns,
+            timeout,
+        )
+
+        while time.monotonic() < deadline:
+            try:
+                samples = await self._measure_fn(self.max_samples, self.sample_timeout)
+            except asyncio.CancelledError:  # pragma: no cover - defensive
+                raise
+            except Exception as exc:  # pragma: no cover - network dependent
+                self._log.warning(
+                    "time_sync device=%s action=wait_ready status=error error=%s",
+                    self.device_id,
+                    exc,
+                )
+                samples = []
+
+            filtered = [float(sample) for sample in samples if isinstance(sample, (int, float))]
+            if filtered:
+                for sample in filtered:
+                    window.append(sample)
+                    total_samples += 1
+
+                if len(window) >= min_samples:
+                    mean = sum(window) / len(window)
+                    variance = sum((value - mean) ** 2 for value in window) / len(window)
+                    rms_ns = math.sqrt(variance) * 1e9
+                    if rms_ns <= max_rms_ns:
+                        self._log.info(
+                            "time_sync device=%s action=wait_ready status=ready samples=%d rms_ns=%.0f",
+                            self.device_id,
+                            total_samples,
+                            rms_ns,
+                        )
+                        return True
+
+            if time.monotonic() >= deadline:
+                break
+
+        self._log.warning(
+            "time_sync device=%s action=wait_ready status=timeout samples=%d rms_ns=%s",
+            self.device_id,
+            total_samples,
+            "n/a" if rms_ns is None else f"{rms_ns:.0f}",
+        )
+        return False
 
     async def _sync_locked(self, *, reason: str) -> float:
         try:

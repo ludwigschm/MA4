@@ -59,3 +59,27 @@ def test_sync_failure_keeps_last_offset_and_warns(caplog):
     result = asyncio.run(manager.maybe_resync(observed_drift_s=0.1))
     assert result == 0.0
     assert any("device=dev3" in record.message for record in caplog.records)
+
+
+def test_wait_ready_collects_enough_samples():
+    batches = [
+        [1.0e-6, 1.1e-6],
+        [0.9e-6, 1.05e-6],
+        [1.0e-6],
+    ]
+    call_count = 0
+
+    async def measure(samples: int, timeout: float) -> list[float]:
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0)
+        if batches:
+            return batches.pop(0)
+        return []
+
+    manager = TimeSyncManager("dev4", measure, max_samples=5, sample_timeout=0.05)
+    ready = asyncio.run(
+        manager.wait_ready(min_samples=5, max_rms_ns=200_000, timeout=1.0)
+    )
+    assert ready is True
+    assert call_count == 3

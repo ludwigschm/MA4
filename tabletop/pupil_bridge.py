@@ -123,6 +123,16 @@ class _BridgeDeviceClient(DeviceClient):
         self._cfg = cfg
 
     async def recording_start(self, *, label: str | None = None) -> None:
+        if self._bridge._active_recording.get(self._player):
+            raise RecordingHttpError(400, "Already recording!")
+
+        ready = await self._bridge._wait_for_time_sync_gate(
+            self._player,
+            reason="recording.start",
+        )
+        if not ready:
+            raise RecordingHttpError(503, "time sync not ready", transient=True)
+
         def _start() -> None:
             if self._bridge._active_recording.get(self._player):
                 raise RecordingHttpError(400, "Already recording!")
@@ -585,6 +595,118 @@ class PupilBridge:
             log.warning("Initial time sync failed for %s: %s", player, exc)
         self._time_sync[player] = manager
         self._schedule_periodic_resync(player)
+
+    async def _wait_for_time_sync_gate(
+        self,
+        player: str,
+        *,
+        reason: str,
+        min_samples: int = 60,
+        max_rms_ns: int = 2_000_000,
+        timeout: float = 5.0,
+        attempts: int = 2,
+        retry_delay: float = 2.0,
+    ) -> bool:
+        manager = self._time_sync.get(player)
+        if manager is None:
+            log.warning(
+                "time_sync gate failed (no manager) player=%s reason=%s",
+                player,
+                reason,
+            )
+            return False
+
+        device = manager.device_id
+        log.info(
+            "time_sync gate enter player=%s device=%s reason=%s attempts=%d",
+            player,
+            device,
+            reason,
+            attempts,
+        )
+
+        attempts = max(1, int(attempts))
+        retry_delay = max(0.0, float(retry_delay))
+        for attempt in range(1, attempts + 1):
+            ready = await manager.wait_ready(
+                min_samples=min_samples,
+                max_rms_ns=max_rms_ns,
+                timeout=timeout,
+            )
+            if ready:
+                log.info(
+                    "time_sync gate ready player=%s device=%s reason=%s attempt=%d",
+                    player,
+                    device,
+                    reason,
+                    attempt,
+                )
+                return True
+            if attempt < attempts:
+                log.info(
+                    "time_sync gate retry player=%s device=%s reason=%s attempt=%d",
+                    player,
+                    device,
+                    reason,
+                    attempt,
+                )
+                await asyncio.sleep(retry_delay)
+
+        log.warning(
+            "time_sync gate failed player=%s device=%s reason=%s attempts=%d",
+            player,
+            device,
+            reason,
+            attempts,
+        )
+        return False
+
+    def wait_for_time_sync_gate(
+        self,
+        player: str,
+        *,
+        reason: str,
+        min_samples: int = 60,
+        max_rms_ns: int = 2_000_000,
+        timeout: float = 5.0,
+        attempts: int = 2,
+        retry_delay: float = 2.0,
+    ) -> bool:
+        loop = self._async_loop
+        if loop.is_closed():
+            log.warning(
+                "time_sync gate skipped (loop closed) player=%s reason=%s",
+                player,
+                reason,
+            )
+            return False
+
+        attempts = max(1, int(attempts))
+        timeout = float(timeout)
+        retry_delay = max(0.0, float(retry_delay))
+        total_timeout = attempts * timeout + max(0, attempts - 1) * retry_delay + 1.0
+        future = asyncio.run_coroutine_threadsafe(
+            self._wait_for_time_sync_gate(
+                player,
+                reason=reason,
+                min_samples=min_samples,
+                max_rms_ns=max_rms_ns,
+                timeout=timeout,
+                attempts=attempts,
+                retry_delay=retry_delay,
+            ),
+            loop,
+        )
+        try:
+            return future.result(timeout=total_timeout)
+        except Exception as exc:
+            log.warning(
+                "time_sync gate error player=%s reason=%s error=%s",
+                player,
+                reason,
+                exc,
+            )
+            return False
 
     def _schedule_periodic_resync(self, player: str) -> None:
         existing = self._time_sync_tasks.get(player)
@@ -1140,6 +1262,12 @@ class PupilBridge:
         session: Optional[int] = None,
         block: Optional[int] = None,
     ) -> Optional[Any]:
+        if not self.wait_for_time_sync_gate(player, reason="recording.start"):
+            log.warning(
+                "recording start skipped (time sync) player=%s", player
+            )
+            return None
+
         success, _ = self._invoke_recording_start(player, device)
         if not success:
             return None
