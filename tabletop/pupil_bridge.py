@@ -40,9 +40,7 @@ except Exception:  # pragma: no cover - optional dependency
 log = logging.getLogger(__name__)
 
 from tabletop.utils.runtime import (
-    event_batch_size_override,
-    event_batch_window_override,
-    is_low_latency_disabled,
+    get_latency_config,
     is_perf_logging_enabled,
 )
 
@@ -306,7 +304,8 @@ class PupilBridge:
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
         self._auto_players: set[str] = set()
-        self._low_latency_disabled = is_low_latency_disabled()
+        latency_config = get_latency_config()
+        self._low_latency_disabled = latency_config.low_latency_disabled
         self._perf_logging = is_perf_logging_enabled()
         self._event_queue_maxsize = 1000
         self._event_queue_drop = 0
@@ -314,8 +313,8 @@ class PupilBridge:
         self._sender_stop = threading.Event()
         self._event_queue: Optional[queue.Queue[object]] = None
         self._sender_thread: Optional[threading.Thread] = None
-        configured_batch_size = event_batch_size_override(4)
-        configured_batch_window = event_batch_window_override(0.005)
+        configured_batch_size = latency_config.event_batch_size
+        configured_batch_window = latency_config.event_batch_window_seconds
         if self._low_latency_disabled:
             self._event_batch_size = 1
             self._event_batch_window = 0.0
