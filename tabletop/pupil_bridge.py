@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -61,6 +62,12 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "neon_devices.txt"
 _HEX_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16,})")
 
 _HIGH_PRIORITY_PREFIXES: tuple[str, ...] = ("button.", "action.", "sync.", "fix.")
+
+try:
+    _DRIFT_INTERVAL = float(os.environ.get("DRIFT_MARKER_INTERVAL_S", "8"))
+except ValueError:
+    _DRIFT_INTERVAL = 8.0
+DRIFT_MARKER_INTERVAL_S = max(0.0, _DRIFT_INTERVAL)
 
 
 def _ensure_config_file(path: Path) -> None:
@@ -175,6 +182,7 @@ class _BridgeDeviceClient(DeviceClient):
                     label,
                 )
             self._bridge._active_recording[self._player] = True
+            self._bridge._start_drift_keepalive(self._player)
 
         await asyncio.to_thread(_start)
 
@@ -206,6 +214,7 @@ class _BridgeDeviceClient(DeviceClient):
                     warn=False,
                 )
             self._bridge._active_recording[self._player] = False
+            self._bridge._stop_drift_keepalive(self._player)
 
         await asyncio.to_thread(_stop)
 
@@ -324,6 +333,9 @@ class PupilBridge:
         self._resync_state: Dict[str, _ResyncBufferState] = {}
         self._active_router_player: Optional[str] = None
         self._player_device_id: Dict[str, str] = {}
+        self._drift_marker_interval = float(DRIFT_MARKER_INTERVAL_S or 0.0)
+        self._drift_keepalive_tasks: Dict[str, asyncio.Future[None]] = {}
+        self._drift_keepalive_paused = False
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(
             target=self._async_loop.run_forever,
@@ -570,6 +582,7 @@ class PupilBridge:
             "event": "auto_start",
             "recording_id": None,
         }
+        self._start_drift_keepalive(player)
 
     def _on_device_connected(
         self,
@@ -1306,6 +1319,7 @@ class PupilBridge:
                 pass
         self._time_sync_tasks.clear()
         self._time_sync.clear()
+        self._stop_all_drift_keepalive()
         if self._async_loop.is_running():
             async def _cancel_all() -> None:
                 for task in asyncio.all_tasks():
@@ -1348,6 +1362,7 @@ class PupilBridge:
                 self._device_by_player[player] = None
         for player in list(self._active_recording):
             self._active_recording[player] = False
+            self._stop_drift_keepalive(player)
         self._recording_metadata.clear()
 
     # ------------------------------------------------------------------
@@ -1445,6 +1460,7 @@ class PupilBridge:
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
         self.send_event("session.recording_started", player, payload)
+        self._start_drift_keepalive(player)
 
     def _send_recording_start(
         self,
@@ -1780,6 +1796,7 @@ class PupilBridge:
 
         if player in self._active_recording:
             self._active_recording[player] = False
+        self._stop_drift_keepalive(player)
         self._recording_metadata.pop(player, None)
 
     def connected_players(self) -> list[str]:
@@ -2015,6 +2032,105 @@ class PupilBridge:
             payload,
             priority="high",
         )
+
+    # ------------------------------------------------------------------
+    def set_drift_keepalive_paused(self, paused: bool) -> None:
+        """Toggle whether drift keepalive markers should be paused."""
+
+        paused_flag = bool(paused)
+        if self._drift_keepalive_paused == paused_flag:
+            return
+        self._drift_keepalive_paused = paused_flag
+        log.info("drift keepalive %s", "paused" if paused_flag else "resumed")
+
+    def _is_resync_active(self, player: str) -> bool:
+        state = self._resync_state.get(player)
+        if state is None:
+            return False
+        return state.active or state.awaiting_ready
+
+    def _emit_drift_keepalive_marker(self, player: str) -> None:
+        event_id = str(uuid.uuid4())
+        t_host_ns = time.perf_counter_ns()
+        payload: Dict[str, Any] = {
+            "event_id": event_id,
+            "t_local_ns": t_host_ns,
+            "origin_player": player,
+            "origin_device": "host_drift_keepalive",
+            "provisional": False,
+            "reason": "drift_keepalive",
+        }
+        metadata = self._recording_metadata.get(player)
+        if isinstance(metadata, dict):
+            for key in ("session", "block", "recording_label"):
+                if key in metadata and key not in payload:
+                    payload[key] = metadata[key]
+        self.send_event("sync.flash_beep", player, payload, priority="high")
+        self.send_host_mirror(
+            player,
+            event_id,
+            t_host_ns,
+            extra={"reason": "drift_keepalive"},
+        )
+
+    def _start_drift_keepalive(self, player: str) -> None:
+        if self._drift_marker_interval <= 0.0:
+            return
+        if self._async_loop.is_closed():
+            return
+
+        existing = self._drift_keepalive_tasks.get(player)
+        if existing is not None:
+            existing.cancel()
+
+        interval = max(1.0, self._drift_marker_interval)
+        step = min(1.0, max(0.1, interval / 8.0))
+
+        async def drift_keepalive_task() -> None:
+            try:
+                while True:
+                    if not self._active_recording.get(player):
+                        return
+                    remaining = interval
+                    while remaining > 0:
+                        if not self._active_recording.get(player):
+                            return
+                        if self._drift_keepalive_paused or self._is_resync_active(player):
+                            await asyncio.sleep(step)
+                            continue
+                        await asyncio.sleep(step)
+                        remaining = max(0.0, remaining - step)
+                    if not self._active_recording.get(player):
+                        return
+                    if self._drift_keepalive_paused or self._is_resync_active(player):
+                        continue
+                    try:
+                        self._emit_drift_keepalive_marker(player)
+                    except Exception:  # pragma: no cover - defensive
+                        log.debug(
+                            "drift keepalive marker failed for %s", player, exc_info=True
+                        )
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._drift_keepalive_tasks.pop(player, None)
+
+        future = asyncio.run_coroutine_threadsafe(drift_keepalive_task(), self._async_loop)
+        self._drift_keepalive_tasks[player] = future
+
+    def _stop_drift_keepalive(self, player: str) -> None:
+        future = self._drift_keepalive_tasks.pop(player, None)
+        if future is None:
+            return
+        future.cancel()
+        try:
+            future.result(timeout=0.1)
+        except Exception:
+            pass
+
+    def _stop_all_drift_keepalive(self) -> None:
+        for player in list(self._drift_keepalive_tasks):
+            self._stop_drift_keepalive(player)
 
     def refine_event(
         self,

@@ -436,6 +436,18 @@ class TabletopRoot(FloatLayout):
     def _mark_bridge_dirty(self) -> None:
         self._bridge_state_dirty = True
 
+    def _set_drift_keepalive_paused(self, paused: bool) -> None:
+        bridge = self._bridge
+        if bridge is None:
+            return
+        setter = getattr(bridge, "set_drift_keepalive_paused", None)
+        if not callable(setter):
+            return
+        try:
+            setter(bool(paused))
+        except Exception:
+            log.debug("Aktualisierung des Drift-Keepalive-Status fehlgeschlagen", exc_info=True)
+
     def _ensure_bridge_recordings(self, *_: Any, force: bool = False) -> None:
         if not self._bridge or not self.session_configured:
             return
@@ -1380,6 +1392,7 @@ class TabletopRoot(FloatLayout):
                     self.in_block_pause = False
                     self.pause_message = ''
                     self.update_pause_overlay()
+                    self._set_drift_keepalive_paused(False)
                     self.setup_round()
                     if self.session_finished:
                         self.apply_phase()
@@ -1532,6 +1545,7 @@ class TabletopRoot(FloatLayout):
             self.pause_message = message
             self.update_pause_overlay()
             self.update_user_displays()
+            self._set_drift_keepalive_paused(True)
             return
         if result.in_block_pause:
             self.in_block_pause = True
@@ -1541,6 +1555,7 @@ class TabletopRoot(FloatLayout):
             )
             self.update_pause_overlay()
             self.update_user_displays()
+            self._set_drift_keepalive_paused(True)
             return
 
         def start_round():
@@ -2112,6 +2127,7 @@ class TabletopRoot(FloatLayout):
         self.in_block_pause = False
         self.pause_message = ''
         self.in_round_pause = False
+        self._set_drift_keepalive_paused(False)
         self.next_block_preview = None
         self.fixation_required = False
         self.pending_round_start_log = False
