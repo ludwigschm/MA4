@@ -240,6 +240,7 @@ class TabletopRoot(FloatLayout):
         self._heartbeat_label = "sync.heartbeat"
         self._heartbeat_counter = 0
         self._origin_device_id = "host_ui"
+        self._timestamp_mapping_warned = False
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
@@ -639,6 +640,23 @@ class TabletopRoot(FloatLayout):
                 event_payload["mapping_version"] = mapping_version
                 event_payload["origin_device"] = self._origin_device_id
                 event_payload.setdefault("origin_player", player)
+                host_ts = event_payload.get("timestamp_host_ns")
+                if (
+                    host_ts is not None
+                    and "timestamp_device_ns" not in event_payload
+                ):
+                    try:
+                        host_ns_int = int(host_ts)
+                    except Exception:
+                        host_ns_int = None
+                    if host_ns_int is not None:
+                        device_ns, ready = self.map_host_to_device_ns(
+                            player, host_ns_int
+                        )
+                        if ready and device_ns is not None:
+                            event_payload["timestamp_device_ns"] = device_ns
+                        else:
+                            self._warn_timestamp_mapping_unavailable()
                 if session_label:
                     event_payload.setdefault("session_label", session_label)
                 if session_number is not None:
@@ -675,6 +693,31 @@ class TabletopRoot(FloatLayout):
             self._notify_event_pipeline(name, event_id, t_local_ns)
 
         self._bridge_dispatcher.submit(_dispatch)  # non-blocking: moved to worker
+
+    def map_host_to_device_ns(
+        self, player: str, host_ns: int
+    ) -> tuple[Optional[int], bool]:
+        """Resolve device time for a host timestamp if a mapping exists."""
+
+        reconciler = self._time_reconciler
+        if reconciler is None:
+            return (None, False)
+        mapper = getattr(reconciler, "host_to_device_ns", None)
+        if not callable(mapper):
+            return (None, False)
+        try:
+            return mapper(player, int(host_ns))
+        except Exception:
+            log.debug("host_to_device_ns mapping failed", exc_info=True)
+            return (None, False)
+
+    def _warn_timestamp_mapping_unavailable(self) -> None:
+        if self._timestamp_mapping_warned:
+            return
+        self._timestamp_mapping_warned = True
+        log.warning(
+            "Timestamp mapping unavailable – falling back to host clock timestamps"
+        )
 
     def _emit_button_bridge_event(
         self,

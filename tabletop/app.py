@@ -388,6 +388,8 @@ class TabletopApp(App):
                 "modifiers": modifiers,
             }
         )
+        t_host_ns = time.perf_counter_ns()
+        payload["timestamp_host_ns"] = t_host_ns
         root = cast(Optional[TabletopRoot], self.root)
         if root is not None:
             try:
@@ -417,6 +419,19 @@ class TabletopApp(App):
             return
         for player in players:
             payload_copy = dict(payload)
+            device_ns = None
+            mapping_ready = False
+            if root is not None:
+                device_ns, mapping_ready = root.map_host_to_device_ns(player, t_host_ns)
+            if mapping_ready and device_ns is not None:
+                payload_copy["timestamp_device_ns"] = device_ns
+            else:
+                if root is not None:
+                    root._warn_timestamp_mapping_unavailable()
+                else:
+                    log.warning(
+                        "Timestamp mapping unavailable – falling back to host clock timestamps"
+                    )
             payload_copy["target_player"] = player
             self._bridge.send_event(event_name, player, payload_copy)
 

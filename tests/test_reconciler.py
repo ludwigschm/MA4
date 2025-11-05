@@ -221,6 +221,31 @@ def test_reconciler_pairs_host_mirror_samples() -> None:
     assert state.confidence >= TimeReconciler.CONF_MIN
 
 
+def test_host_to_device_mapping_ready_flag() -> None:
+    players = ["VP1"]
+    model = {"VP1": (8_000_000.0, 1.00001)}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=20)
+
+    start_ns = 3_000_000_000
+
+    device_ns, ready = reconciler.host_to_device_ns("VP1", start_ns)
+    assert device_ns is None
+    assert ready is False
+
+    for index in range(40):
+        t_local_ns = start_ns + index * 30_000_000
+        _inject_marker(reconciler, bridge, players, model, t_local_ns)
+
+    host_ns = start_ns + 750_000_000
+    device_ns, ready = reconciler.host_to_device_ns("VP1", host_ns)
+    assert ready is True
+    expected_ns = int(model["VP1"][0] + model["VP1"][1] * host_ns)
+    assert device_ns is not None
+    assert abs(device_ns - expected_ns) < 5_000_000
+
+
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
     db_path = tmp_path / "events.sqlite3"
     logger = EventLogger(str(db_path))
