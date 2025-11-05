@@ -10,15 +10,20 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Deque, Dict, Iterable, Literal, Optional, Tuple, Union
 
 from core.capabilities import CapabilityRegistry, DeviceCapabilities
 from core.device_registry import DeviceRegistry
 from core.event_router import EventRouter, UIEvent
 from core.recording import DeviceClient, RecordingController, RecordingHttpError
-from core.time_sync import TimeSyncManager
+from core.time_sync import (
+    TimeSyncManager,
+    TimeSyncResyncMetrics,
+    TimeSyncResyncObserver,
+)
 
 try:  # pragma: no cover - optional dependency
     from pupil_labs.realtime_api.simple import Device, discover_devices
@@ -108,6 +113,26 @@ class _QueuedEvent:
     t_ui_ns: int
     t_enqueue_ns: int
 
+
+@dataclass
+class _ResyncBufferState:
+    """Track buffered events while a time resync is in progress."""
+
+    active: bool = False
+    start_monotonic: float = 0.0
+    awaiting_ready: bool = False
+    buffered_total: int = 0
+    device_id: str = ""
+    metrics: Optional[TimeSyncResyncMetrics] = None
+    _buffer: Deque[Tuple[_QueuedEvent, float]] = field(default_factory=deque)
+
+    def clear(self) -> None:
+        self.active = False
+        self.awaiting_ready = False
+        self.buffered_total = 0
+        self.device_id = ""
+        self.metrics = None
+        self._buffer.clear()
 
 class _BridgeDeviceClient(DeviceClient):
     """Adapter exposing async recording operations for :class:`RecordingController`."""
@@ -296,6 +321,7 @@ class PupilBridge:
         self._time_sync: Dict[str, TimeSyncManager] = {}
         self._time_sync_tasks: Dict[str, asyncio.Future[None]] = {}
         self._recording_controllers: Dict[str, RecordingController] = {}
+        self._resync_state: Dict[str, _ResyncBufferState] = {}
         self._active_router_player: Optional[str] = None
         self._player_device_id: Dict[str, str] = {}
         self._async_loop = asyncio.new_event_loop()
@@ -593,6 +619,7 @@ class PupilBridge:
             measure_fn=measure,
             max_samples=20,
             sample_timeout=0.25,
+            resync_observer=self._build_resync_observer(player),
         )
         try:
             future = asyncio.run_coroutine_threadsafe(
@@ -603,6 +630,164 @@ class PupilBridge:
             log.warning("Initial time sync failed for %s: %s", player, exc)
         self._time_sync[player] = manager
         self._schedule_periodic_resync(player)
+
+    def _build_resync_observer(self, player: str) -> TimeSyncResyncObserver:
+        bridge = self
+
+        class _Observer(TimeSyncResyncObserver):
+            def on_resync_begin(self, device_id: str) -> None:
+                bridge._handle_resync_begin(player, device_id)
+
+            def on_resync_complete(
+                self, device_id: str, metrics: TimeSyncResyncMetrics
+            ) -> None:
+                bridge._handle_resync_complete(player, device_id, metrics)
+
+            def on_resync_wait_ready(
+                self,
+                device_id: str,
+                ready: bool,
+                total_samples: int,
+                rms_ns: float | None,
+            ) -> None:
+                bridge._handle_resync_wait_ready(
+                    player, device_id, ready, total_samples, rms_ns
+                )
+
+        return _Observer()
+
+    def _get_resync_state(self, player: str) -> _ResyncBufferState:
+        state = self._resync_state.get(player)
+        if state is None:
+            state = _ResyncBufferState()
+            self._resync_state[player] = state
+        return state
+
+    def _handle_resync_begin(self, player: str, device_id: str) -> None:
+        state = self._get_resync_state(player)
+        state.clear()
+        state.active = True
+        state.start_monotonic = time.monotonic()
+        state.device_id = device_id
+        marker_event_id = str(uuid.uuid4())
+        payload = {
+            "event_id": marker_event_id,
+            "reason": "time_resync",
+            "device_id": device_id,
+            "origin_player": player,
+        }
+        log.info(
+            "time_sync resync begin player=%s device=%s", player, device_id or player
+        )
+        try:
+            self.send_event(
+                "sync.resync_marker",
+                player,
+                payload,
+                priority="high",
+            )
+            self.send_host_mirror(
+                player,
+                marker_event_id,
+                time.perf_counter_ns(),
+                extra={"reason": "time_resync", "device_id": device_id},
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Failed to emit resync marker for %s", player, exc_info=True)
+
+    def _handle_resync_complete(
+        self, player: str, device_id: str, metrics: TimeSyncResyncMetrics
+    ) -> None:
+        state = self._get_resync_state(player)
+        if not state.active:
+            state.active = True
+            state.start_monotonic = time.monotonic()
+        state.metrics = metrics
+        state.awaiting_ready = metrics.success
+        state.device_id = device_id or state.device_id
+        if not metrics.success:
+            self._finalise_resync(player, device_id, ready=False, rms_ns=None, samples=0)
+
+    def _handle_resync_wait_ready(
+        self,
+        player: str,
+        device_id: str,
+        ready: bool,
+        total_samples: int,
+        rms_ns: float | None,
+    ) -> None:
+        self._finalise_resync(
+            player,
+            device_id,
+            ready=ready,
+            rms_ns=rms_ns,
+            samples=total_samples,
+        )
+
+    def _buffer_resync_event(self, player: str, event: _QueuedEvent) -> bool:
+        state = self._resync_state.get(player)
+        if state is None or not state.active:
+            return False
+        now = time.monotonic()
+        max_age = 0.1
+        while state._buffer and now - state._buffer[0][1] >= max_age:
+            stale, _ = state._buffer.popleft()
+            self._dispatch_with_metrics(stale)
+        if not state.active:
+            return False
+        state._buffer.append((event, now))
+        state.buffered_total += 1
+        return True
+
+    def _finalise_resync(
+        self,
+        player: str,
+        device_id: str,
+        *,
+        ready: bool,
+        rms_ns: float | None,
+        samples: int,
+    ) -> None:
+        state = self._get_resync_state(player)
+        if not state.active and not state._buffer:
+            return
+        duration_total_ms = (
+            (time.monotonic() - state.start_monotonic) * 1000.0
+            if state.start_monotonic
+            else 0.0
+        )
+        metrics = state.metrics
+        measure_ms = metrics.duration_s * 1000.0 if metrics else 0.0
+        if metrics is not None:
+            offset_value = metrics.offset_s
+            drift_s = metrics.offset_delta_s
+            variance = metrics.variance
+        else:
+            manager = self._time_sync.get(player)
+            offset_value = manager.get_offset_s() if manager else 0.0
+            drift_s = 0.0
+            variance = None
+        flushed = 0
+        while state._buffer:
+            buffered, _ = state._buffer.popleft()
+            self._dispatch_with_metrics(buffered)
+            flushed += 1
+        log.info(
+            "time_sync resync summary player=%s device=%s ready=%s buffered=%d flushed=%d measure_ms=%.1f total_ms=%.1f offset_s=%.6f drift_s=%.6f rms_ns=%s variance=%s samples=%d",
+            player,
+            device_id or state.device_id or player,
+            "yes" if ready else "no",
+            state.buffered_total,
+            flushed,
+            measure_ms,
+            duration_total_ms,
+            offset_value,
+            drift_s,
+            "n/a" if rms_ns is None else f"{rms_ns:.0f}",
+            "n/a" if variance is None else f"{variance:.9f}",
+            samples,
+        )
+        state.clear()
 
     async def _wait_for_time_sync_gate(
         self,
@@ -1741,6 +1926,8 @@ class PupilBridge:
             t_ui_ns=int(t_ui_ns),
             t_enqueue_ns=enqueue_ns,
         )
+        if event_priority == "normal" and self._buffer_resync_event(player, queued):
+            return
         if self._low_latency_disabled or self._event_queue is None or event_priority == "high":
             self._dispatch_with_metrics(queued)
             return

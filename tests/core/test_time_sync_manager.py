@@ -83,3 +83,57 @@ def test_wait_ready_collects_enough_samples():
     )
     assert ready is True
     assert call_count == 3
+
+
+def test_resync_observer_receives_metrics():
+    measurements = [
+        [0.010, 0.011, 0.009],
+        [0.012, 0.013, 0.011],
+        [0.012, 0.0125, 0.0115],
+    ]
+
+    async def measure(samples: int, timeout: float) -> list[float]:
+        if measurements:
+            return measurements.pop(0)
+        return [0.012]
+
+    class _Observer:
+        def __init__(self) -> None:
+            self.events: list[tuple] = []
+
+        def on_resync_begin(self, device_id: str) -> None:
+            self.events.append(("begin", device_id))
+
+        def on_resync_complete(self, device_id: str, metrics) -> None:
+            self.events.append(("complete", device_id, metrics))
+
+        def on_resync_wait_ready(
+            self, device_id: str, ready: bool, total_samples: int, rms_ns: float | None
+        ) -> None:
+            self.events.append(("wait_ready", device_id, ready, total_samples, rms_ns))
+
+    observer = _Observer()
+    manager = TimeSyncManager(
+        "dev5",
+        measure,
+        max_samples=3,
+        sample_timeout=0.05,
+        resync_observer=observer,
+        drift_threshold_s=0.0,
+    )
+
+    asyncio.run(manager.initial_sync())
+    asyncio.run(manager.maybe_resync(observed_drift_s=0.01))
+    assert observer.events[0][0] == "begin"
+    assert observer.events[1][0] == "complete"
+    metrics = observer.events[1][2]
+    assert metrics.success is True
+    assert metrics.sample_count == 3
+    assert metrics.offset_delta_s != 0.0
+
+    ready = asyncio.run(
+        manager.wait_ready(min_samples=3, max_rms_ns=1_000_000_000, timeout=0.2)
+    )
+    assert ready is True
+    assert observer.events[-1][0] == "wait_ready"
+    assert observer.events[-1][2] is True
