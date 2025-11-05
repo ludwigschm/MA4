@@ -55,6 +55,8 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "neon_devices.txt"
 
 _HEX_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16,})")
 
+_HIGH_PRIORITY_PREFIXES: tuple[str, ...] = ("button.", "action.", "sync.", "fix.")
+
 
 def _ensure_config_file(path: Path) -> None:
     if path.exists():
@@ -278,8 +280,14 @@ class PupilBridge:
         self._sender_stop = threading.Event()
         self._event_queue: Optional[queue.Queue[object]] = None
         self._sender_thread: Optional[threading.Thread] = None
-        self._event_batch_size = event_batch_size_override(4)
-        self._event_batch_window = event_batch_window_override(0.005)
+        configured_batch_size = event_batch_size_override(4)
+        configured_batch_window = event_batch_window_override(0.005)
+        if self._low_latency_disabled:
+            self._event_batch_size = 1
+            self._event_batch_window = 0.0
+        else:
+            self._event_batch_size = configured_batch_size
+            self._event_batch_window = configured_batch_window
         self._last_queue_log = 0.0
         self._last_send_log = 0.0
         self._offset_semantics_warned: set[str] = set()
@@ -1720,7 +1728,7 @@ class PupilBridge:
             t_ui_ns = time.perf_counter_ns()
             prepared_payload["t_local_ns"] = t_ui_ns
         event_priority: Literal["high", "normal"]
-        if event.priority == "high" or event.name.startswith(("sync.", "fix.")):
+        if event.priority == "high" or event.name.startswith(_HIGH_PRIORITY_PREFIXES):
             event_priority = "high"
         else:
             event_priority = "normal"
@@ -1783,8 +1791,9 @@ class PupilBridge:
         """Send an event to the player's device, encoding payload as JSON suffix."""
 
         event_payload = dict(payload or {})
+        enforced_priority = "high" if name.startswith(_HIGH_PRIORITY_PREFIXES) else priority
         event_priority: Literal["high", "normal"] = (
-            "high" if priority == "high" else "normal"
+            "high" if enforced_priority == "high" else "normal"
         )
         ui_event = UIEvent(
             name=name,

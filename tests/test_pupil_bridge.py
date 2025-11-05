@@ -61,6 +61,19 @@ def test_event_router_single_target(bridge):
     assert args[0].startswith("ui.test")
 
 
+def test_high_priority_prefix_enforced(monkeypatch: pytest.MonkeyPatch, bridge) -> None:
+    pupil_bridge, _ = bridge
+    captured: list = []
+
+    def capture(event):
+        captured.append(event)
+
+    monkeypatch.setattr(pupil_bridge._event_router, "route", capture)  # type: ignore[attr-defined]
+    pupil_bridge.send_event("button.click", "VP1", {})
+    assert captured
+    assert captured[0].priority == "high"
+
+
 def test_recording_start_idempotent(bridge):
     pupil_bridge, device = bridge
     pupil_bridge.start_recording(1, 1, "VP1")

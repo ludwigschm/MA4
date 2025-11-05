@@ -739,7 +739,12 @@ def run_demo(*, duration: float = 8.0, heartbeat_interval: float = 2.0) -> None:
             return (0, 100)
 
         def send_event(
-            self, name: str, player: str, payload: Optional[dict[str, Any]] = None
+            self,
+            name: str,
+            player: str,
+            payload: Optional[dict[str, Any]] = None,
+            *,
+            priority: str = "normal",
         ) -> None:
             payload = payload or {}
             event_id = payload.get("event_id", "?")

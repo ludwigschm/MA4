@@ -35,3 +35,15 @@ def test_batching_flushes_periodically():
     assert ("VP1", "a") in deliveries
     assert ("VP1", "b") in deliveries
     router.flush_all()
+
+
+def test_high_priority_bypasses_batch():
+    deliveries: list[tuple[str, str]] = []
+
+    def deliver(player: str, event: UIEvent) -> None:
+        deliveries.append((player, event.name))
+
+    router = EventRouter(deliver, batch_interval_s=10.0, max_batch=100)
+    router.set_active_player("VP1")
+    router.route(UIEvent(name="urgent", priority="high"))
+    assert deliveries == [("VP1", "urgent")]

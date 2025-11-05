@@ -31,8 +31,8 @@ class EventRouter:
         self,
         deliver: Callable[[str, UIEvent], None],
         *,
-        batch_interval_s: float = 0.016,
-        max_batch: int = 32,
+        batch_interval_s: float = 0.005,
+        max_batch: int = 4,
         multi_route: bool = False,
     ) -> None:
         self._deliver = deliver
