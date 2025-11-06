@@ -584,6 +584,7 @@ class PupilBridge:
         payload = dict(metadata)
         payload.setdefault("player", player)
         payload.setdefault("recording_id", None)
+        payload.setdefault("confirmed_monotonic", time.monotonic())
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
         self._start_drift_keepalive(player)
@@ -727,7 +728,7 @@ class PupilBridge:
 
         if unsupported == 3:
             log.info(
-                "Keine expliziten Stream-Endpoints auf %s – nehme Auto-Stream an.",
+                "No explicit stream endpoints on %s – assuming auto-stream.",
                 player,
             )
             return True
@@ -735,43 +736,23 @@ class PupilBridge:
         return False
 
     def _status_indicates_video(self, player: str) -> bool:
-        """Nutze Gerätestatus, um Video-Verfügbarkeit zu erkennen.
+        """Nutze den letzten Gerätestatus als Streaming-Fallback."""
 
-        Akzeptiert Sensor-Einträge für world/eyes/gaze mit ``connected`` == True und
-        ohne ``stream_error``.
-        """
-
-        device = self._device_by_player.get(player)
-        if device is None:
-            return False
-        status = self._get_device_status(device)
-        if not status:
-            return False
-
-        try:
-            items = (
-                status
-                if isinstance(status, list)
-                else status.get("items")
-                or status.get("data")
-                or []
-            )
-        except Exception:
-            items = []
+        status = self._get_device_status(self._device_by_player.get(player))
+        items = status if isinstance(status, list) else (status or {}).get("items", [])
 
         ok = False
         for entry in items:
             if not isinstance(entry, dict):
                 continue
+            if entry.get("model") != "Sensor":
+                continue
             data = entry.get("data", {})
             if not isinstance(data, dict):
                 continue
-            model = entry.get("model", "")
-            if model != "Sensor":
-                continue
             sensor = str(data.get("sensor", "")).lower()
             if sensor in {"world", "eyes", "gaze"}:
-                if bool(data.get("connected")) and not bool(data.get("stream_error")):
+                if data.get("connected") and not data.get("stream_error"):
                     ok = True
         return ok
 
@@ -1755,6 +1736,59 @@ class PupilBridge:
             },
         )
         return True
+
+    def is_recording_active(self, player: str) -> bool:
+        """Return ``True`` if the local state marks a recording as active."""
+
+        return bool(self._active_recording.get(player))
+
+    def recording_was_confirmed(
+        self, player: str, *, within_s: float = 3.0
+    ) -> bool:
+        """Return ``True`` if a recent confirmation marker exists."""
+
+        metadata = self._recording_metadata.get(player)
+        if not isinstance(metadata, dict):
+            return False
+        timestamp = metadata.get("confirmed_monotonic")
+        if timestamp is None:
+            return False
+        try:
+            elapsed = time.monotonic() - float(timestamp)
+        except (TypeError, ValueError):
+            return False
+        return elapsed <= max(0.0, within_s)
+
+    def ensure_recording(
+        self,
+        player: str,
+        *,
+        label: Optional[str] = None,
+        tries: int = 1,
+        wait_s: float = 0.5,
+    ) -> None:
+        """Ensure a recording is active, retrying REST fallbacks if required."""
+
+        attempts = max(1, int(tries))
+        delay = max(0.0, float(wait_s))
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(attempts):
+            if self.is_recording_active(player) or self.is_recording(player):
+                return
+
+            if self.start_external_recording(player, label=label):
+                return
+
+            last_error = RuntimeError(
+                f"Recording start failed for {player} (attempt {attempt + 1}/{attempts})"
+            )
+            if attempt < attempts - 1 and delay:
+                time.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Recording start failed for {player}")
 
     def is_recording(self, player: str) -> bool:
         """Return ``True`` when the player has an active recording."""
