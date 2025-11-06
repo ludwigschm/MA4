@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - optional dependency
 log = logging.getLogger(__name__)
 
 from tabletop.utils.runtime import (
+    are_eye_trackers_managed_externally,
     get_latency_config,
     is_perf_logging_enabled,
 )
@@ -84,6 +85,18 @@ class NeonDeviceConfig:
     ip: str = ""
     port: Optional[int] = None
     port_invalid: bool = False
+
+    @classmethod
+    def load(
+        cls, role: str, *, path: Optional[Path] = None
+    ) -> "NeonDeviceConfig":
+        """Load the configuration for the given role from disk."""
+
+        configs = _load_device_config(path or CONFIG_PATH)
+        try:
+            return configs[role]
+        except KeyError as exc:  # pragma: no cover - defensive fallback
+            raise ValueError(f"Unbekannte Rolle {role!r}") from exc
 
     @property
     def is_configured(self) -> bool:
@@ -348,6 +361,7 @@ class PupilBridge:
             max_batch=self._event_batch_size,
             multi_route=False,
         )
+        self._external_start = are_eye_trackers_managed_externally()
         self._event_router.set_active_player("VP1")
         self._active_router_player = "VP1"
         if not self._low_latency_disabled:
@@ -429,7 +443,8 @@ class PupilBridge:
                 actual_id,
             )
             self._on_device_connected(player, device, cfg, actual_id)
-            self._auto_start_recording(player, device)
+            if not self._external_start:
+                self._auto_start_recording(player, device)
 
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
@@ -550,6 +565,37 @@ class PupilBridge:
 
         return module_serial or ""
 
+    def _schedule_recording_start(
+        self, player: str, controller: RecordingController, label: str
+    ) -> "asyncio.Future[Any]":
+        async def orchestrate() -> None:
+            await controller.ensure_started(label=label)
+            await controller.begin_segment()
+
+        return asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+
+    def _finalise_recording_start(
+        self,
+        player: str,
+        metadata: Dict[str, Any],
+        *,
+        send_session_event: bool = False,
+    ) -> Dict[str, Any]:
+        payload = dict(metadata)
+        payload.setdefault("player", player)
+        payload.setdefault("recording_id", None)
+        self._active_recording[player] = True
+        self._recording_metadata[player] = payload
+        self._start_drift_keepalive(player)
+        if send_session_event:
+            try:
+                self.send_event("session.recording_started", player, payload)
+            except Exception:  # pragma: no cover - defensive fallback
+                log.debug(
+                    "Emitting session.recording_started failed for %s", player, exc_info=True
+                )
+        return payload
+
     def _auto_start_recording(self, player: str, device: Any) -> None:
         if self._active_recording.get(player):
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
@@ -563,25 +609,21 @@ class PupilBridge:
             controller = self._build_recording_controller(player, device, cfg)
             self._recording_controllers[player] = controller
 
-        async def orchestrate() -> None:
-            await controller.ensure_started(label=label)
-            await controller.begin_segment()
-
-        future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+        future = self._schedule_recording_start(player, controller, label)
         try:
             future.result(timeout=max(1.0, self._connect_timeout))
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Auto recording start failed for %s: %s", player, exc)
             return
 
-        self._active_recording[player] = True
-        self._recording_metadata[player] = {
-            "player": player,
-            "recording_label": label,
-            "event": "auto_start",
-            "recording_id": None,
-        }
-        self._start_drift_keepalive(player)
+        self._finalise_recording_start(
+            player,
+            {
+                "player": player,
+                "recording_label": label,
+                "event": "auto_start",
+            },
+        )
 
     def _on_device_connected(
         self,
@@ -603,6 +645,169 @@ class PupilBridge:
             player, device, cfg
         )
         self._probe_capabilities(player, cfg, device_id)
+
+    # ------------------------------------------------------------------
+    # Streaming helpers
+    def start_streaming(self, player: str, *, timeout: Optional[float] = None) -> None:
+        """Start the preview/stream for the given player if possible."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            raise RuntimeError(f"{player} nicht verbunden")
+
+        if self.is_streaming(player):
+            return
+
+        if not self._invoke_stream_start(player, device):
+            raise RuntimeError(f"Streamstart fehlgeschlagen für {player}")
+
+        effective_timeout = timeout if timeout is not None else self._connect_timeout
+        if not self.wait_for_streaming(player, timeout=effective_timeout):
+            raise TimeoutError(f"Streamstart Timeout für {player}")
+
+    def wait_for_streaming(
+        self, player: str, *, timeout: Optional[float] = None, interval: float = 0.2
+    ) -> bool:
+        """Poll streaming state and notifications until active or timeout."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            return False
+
+        if self.is_streaming(player):
+            return True
+
+        effective_timeout = timeout if timeout is not None else self._connect_timeout
+        deadline = time.monotonic() + max(0.0, effective_timeout)
+        poll_delay = max(0.05, interval)
+        events = (
+            "gaze.streaming.started",
+            "preview.started",
+            "preview.start",
+            "video.stream.started",
+            "world.stream.started",
+        )
+
+        while time.monotonic() < deadline:
+            if self.is_streaming(player):
+                return True
+            for event in events:
+                info = self._wait_for_notification(device, event, timeout=0.05)
+                if info is not None:
+                    return True
+            time.sleep(poll_delay)
+
+        return self.is_streaming(player)
+
+    def _invoke_stream_start(self, player: str, device: Any) -> bool:
+        methods = (
+            "start_stream",
+            "start_streaming",
+            "start_preview",
+            "preview_start",
+            "start_video",
+            "ensure_streaming",
+        )
+        for name in methods:
+            fn = getattr(device, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+                return True
+            except TypeError:
+                try:
+                    fn(player)
+                    return True
+                except Exception:
+                    continue
+            except Exception:
+                log.debug("Streamstart via %s für %s fehlgeschlagen", name, player, exc_info=True)
+        for path in ("/api/stream", "/api/streaming", "/api/preview"):
+            response = self._post_device_api(
+                player,
+                path,
+                {"action": "START"},
+                warn=False,
+            )
+            status_code = getattr(response, "status_code", None)
+            if status_code in {200, 202, 204}:
+                return True
+        return False
+
+    def _coerce_bool_value(self, value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if value == 0:
+                return False
+            if value == 1:
+                return True
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return None
+
+    def is_streaming(self, player: str) -> bool:
+        """Return ``True`` if the player reports an active preview stream."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            return False
+
+        attr_candidates = (
+            "is_streaming",
+            "is_streaming_active",
+            "is_streaming_running",
+            "preview_running",
+            "preview_active",
+            "is_preview_running",
+            "preview_is_running",
+            "streaming_active",
+        )
+        for attr in attr_candidates:
+            candidate = getattr(device, attr, None)
+            result: Any
+            if callable(candidate):
+                try:
+                    result = candidate()
+                except TypeError:
+                    try:
+                        result = candidate(player)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+            else:
+                result = candidate
+            coerced = self._coerce_bool_value(result)
+            if coerced is not None:
+                return coerced
+
+        status = self._get_device_status(device)
+        if isinstance(status, dict):
+            keys = (
+                "preview_active",
+                "preview_running",
+                "streaming",
+                "streaming_active",
+                "streaming_running",
+            )
+            for key in keys:
+                coerced = self._coerce_bool_value(status.get(key))
+                if coerced is not None:
+                    return coerced
+            data = status.get("data")
+            if isinstance(data, dict):
+                for key in keys:
+                    coerced = self._coerce_bool_value(data.get(key))
+                    if coerced is not None:
+                        return coerced
+
+        return False
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
         async def measure(samples: int, timeout: float) -> list[float]:
@@ -1295,7 +1500,8 @@ class PupilBridge:
                     actual_id,
                 )
                 self._on_device_connected(player, prepared, cfg, actual_id)
-                self._auto_start_recording(player, prepared)
+                if not self._external_start:
+                    self._auto_start_recording(player, prepared)
             except Exception as exc:  # pragma: no cover - hardware dependent
                 log.warning("Gerät %s konnte nicht verbunden werden: %s", device_id, exc)
 
@@ -1427,11 +1633,7 @@ class PupilBridge:
             block,
         )
 
-        async def orchestrate() -> None:
-            await controller.ensure_started(label=recording_label)
-            await controller.begin_segment()
-
-        future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+        future = self._schedule_recording_start(player, controller, recording_label)
         try:
             future.result(timeout=max(1.0, self._connect_timeout))
         except RecordingHttpError as exc:
@@ -1449,17 +1651,88 @@ class PupilBridge:
             log.warning("recording start error player=%s error=%s", player, exc)
             return
 
-        payload = {
+        metadata = {
             "session": session,
             "block": block,
             "player": player,
             "recording_label": recording_label,
             "recording_id": None,
         }
-        self._active_recording[player] = True
-        self._recording_metadata[player] = payload
-        self.send_event("session.recording_started", player, payload)
-        self._start_drift_keepalive(player)
+        self._finalise_recording_start(
+            player,
+            metadata,
+            send_session_event=True,
+        )
+
+    def start_external_recording(
+        self, player: str, label: Optional[str] = None
+    ) -> bool:
+        """Start a recording outside the automatic session/block flow."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            log.info("recording.start übersprungen (%s nicht verbunden)", player)
+            return False
+
+        if self._active_recording.get(player):
+            log.debug("Recording already active for %s", player)
+            return True
+
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            cfg = self._device_config.get(player)
+            if cfg is None:
+                log.info("recording.start übersprungen (%s ohne Konfig)", player)
+                return False
+            controller = self._build_recording_controller(player, device, cfg)
+            self._recording_controllers[player] = controller
+
+        actual_label = label or f"external.{player.lower()}.{int(time.time())}"
+        future = self._schedule_recording_start(player, controller, actual_label)
+        try:
+            future.result(timeout=max(1.0, self._connect_timeout))
+        except RecordingHttpError as exc:
+            log.warning(
+                "external recording start failed player=%s status=%s msg=%s",
+                player,
+                exc.status,
+                exc.message,
+            )
+            return False
+        except asyncio.TimeoutError:
+            log.warning("external recording start timeout player=%s", player)
+            return False
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("external recording start error player=%s error=%s", player, exc)
+            return False
+
+        self._finalise_recording_start(
+            player,
+            {
+                "player": player,
+                "recording_label": actual_label,
+                "event": "external_start",
+            },
+        )
+        return True
+
+    def is_recording(self, player: str) -> bool:
+        """Return ``True`` when the player has an active recording."""
+
+        if self._active_recording.get(player):
+            return True
+
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                controller.is_recording(), self._async_loop
+            )
+            return bool(future.result(timeout=max(0.5, self._http_timeout)))
+        except Exception:  # pragma: no cover - defensive fallback
+            return False
 
     def _send_recording_start(
         self,
@@ -2287,4 +2560,4 @@ class PupilBridge:
         return str(value)
 
 
-__all__ = ["PupilBridge"]
+__all__ = ["PupilBridge", "NeonDeviceConfig"]
