@@ -668,7 +668,7 @@ class PupilBridge:
     def wait_for_streaming(
         self, player: str, *, timeout: Optional[float] = None, interval: float = 0.2
     ) -> bool:
-        """Poll streaming state and notifications until active or timeout."""
+        """Poll streaming state until active or timeout."""
 
         device = self._device_by_player.get(player)
         if device is None:
@@ -680,21 +680,9 @@ class PupilBridge:
         effective_timeout = timeout if timeout is not None else self._connect_timeout
         deadline = time.monotonic() + max(0.0, effective_timeout)
         poll_delay = max(0.05, interval)
-        events = (
-            "gaze.streaming.started",
-            "preview.started",
-            "preview.start",
-            "video.stream.started",
-            "world.stream.started",
-        )
-
         while time.monotonic() < deadline:
             if self.is_streaming(player):
                 return True
-            for event in events:
-                info = self._wait_for_notification(device, event, timeout=0.05)
-                if info is not None:
-                    return True
             time.sleep(poll_delay)
 
         return self.is_streaming(player)
@@ -723,6 +711,7 @@ class PupilBridge:
                     continue
             except Exception:
                 log.debug("Streamstart via %s für %s fehlgeschlagen", name, player, exc_info=True)
+        unsupported = 0
         for path in ("/api/stream", "/api/streaming", "/api/preview"):
             response = self._post_device_api(
                 player,
@@ -733,7 +722,58 @@ class PupilBridge:
             status_code = getattr(response, "status_code", None)
             if status_code in {200, 202, 204}:
                 return True
+            if status_code == 404:
+                unsupported += 1
+
+        if unsupported == 3:
+            log.info(
+                "Keine expliziten Stream-Endpoints auf %s – nehme Auto-Stream an.",
+                player,
+            )
+            return True
+
         return False
+
+    def _status_indicates_video(self, player: str) -> bool:
+        """Nutze Gerätestatus, um Video-Verfügbarkeit zu erkennen.
+
+        Akzeptiert Sensor-Einträge für world/eyes/gaze mit ``connected`` == True und
+        ohne ``stream_error``.
+        """
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            return False
+        status = self._get_device_status(device)
+        if not status:
+            return False
+
+        try:
+            items = (
+                status
+                if isinstance(status, list)
+                else status.get("items")
+                or status.get("data")
+                or []
+            )
+        except Exception:
+            items = []
+
+        ok = False
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            model = entry.get("model", "")
+            if model != "Sensor":
+                continue
+            sensor = str(data.get("sensor", "")).lower()
+            if sensor in {"world", "eyes", "gaze"}:
+                if bool(data.get("connected")) and not bool(data.get("stream_error")):
+                    ok = True
+        return ok
 
     def _coerce_bool_value(self, value: Any) -> Optional[bool]:
         if isinstance(value, bool):
@@ -807,7 +847,7 @@ class PupilBridge:
                     if coerced is not None:
                         return coerced
 
-        return False
+        return self._status_indicates_video(player)
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
         async def measure(samples: int, timeout: float) -> list[float]:
@@ -1968,6 +2008,8 @@ class PupilBridge:
             )
             if response is None:
                 log.warning("Setting frame_name failed for %s (no response)", player)
+            elif response.status_code == 404:
+                log.info("Setting frame_name unsupported for %s", player)
             elif response.status_code != 200:
                 log.warning(
                     "Setting frame_name failed for %s (%s)",
