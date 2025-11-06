@@ -2,9 +2,35 @@
 
 from __future__ import annotations
 
+import os
+
+from kivy.config import Config
+
+Config.set("graphics", "fullscreen", "0")
+Config.set("graphics", "borderless", "0")
+Config.set("graphics", "resizable", "1")
+Config.set("graphics", "width", "1600")  # anpassen, falls gewünscht
+Config.set("graphics", "height", "900")  # anpassen, falls gewünscht
+Config.set("graphics", "position", "custom")
+Config.set("graphics", "left", "3440")  # an Monitor-Setup anpassen
+Config.set("graphics", "top", "0")
+os.environ["KIVY_NO_ARGS"] = "1"
+
+from kivy.core.window import Window
+
+
+def _toggle_fullscreen(*_: object) -> None:
+    Window.fullscreen = not Window.fullscreen
+
+
+Window.bind(
+    on_keyboard=lambda w, key, *_: (_toggle_fullscreen() if key == 292 else None)
+)
+
+import kivy  # noqa: F401  # pylint: disable=unused-import
+
 import argparse
 import logging
-import os
 import time
 from typing import Optional, Sequence
 
@@ -64,9 +90,21 @@ def start_eye_trackers_sequence(
     bridge = PupilBridge()
     log.info("Verbinde Eye-Tracker…")
     bridge.connect()
+    connected_players: list[str] = []
+    missing_players: list[str] = []
     for current in target_players:
-        if not bridge.is_connected(current):
-            raise RuntimeError(f"{current} ist nicht verbunden")
+        if bridge.is_connected(current):
+            connected_players.append(current)
+        else:
+            missing_players.append(current)
+    if not connected_players:
+        raise RuntimeError("Keine aktiven Eye-Tracker verbunden")
+    for missing in missing_players:
+        if missing == "VP2":
+            log.warning("VP2 nicht verbunden – später erneut versuchen.")
+        else:
+            log.warning("%s ist nicht verbunden", missing)
+    target_players = connected_players
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
 

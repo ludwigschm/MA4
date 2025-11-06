@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, Literal, Optional, Tuple, Union
@@ -27,10 +28,17 @@ from core.time_sync import (
 )
 
 try:  # pragma: no cover - optional dependency
-    from pupil_labs.realtime_api.simple import Device, discover_devices
+    from pupil_labs.realtime_api.simple import discover_devices
 except Exception:  # pragma: no cover - optional dependency
-    Device = None  # type: ignore[assignment]
     discover_devices = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
+    from pupil_labs.realtime_api.simple.device import Device
+except Exception:  # pragma: no cover - optional dependency
+    try:  # fallback for legacy API surface
+        from pupil_labs.realtime_api.simple import Device  # type: ignore[assignment]
+    except Exception:  # pragma: no cover - optional dependency
+        Device = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
     import requests
@@ -373,6 +381,7 @@ class PupilBridge:
             max_batch=self._event_batch_size,
             multi_route=False,
         )
+        self._event_executor = ThreadPoolExecutor(max_workers=2)
         self._external_start = are_eye_trackers_managed_externally()
         self._event_router.set_active_player("VP1")
         self._active_router_player = "VP1"
@@ -387,6 +396,9 @@ class PupilBridge:
 
     # ---------------------------------------------------------------------
     # Lifecycle management
+    def _log_error(self, message: str) -> None:
+        log.error(message)
+
     def connect(self) -> bool:
         """Discover or configure devices and map them to configured players."""
 
@@ -460,22 +472,53 @@ class PupilBridge:
 
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
+        vp2_cfg = self._device_config.get("VP2")
+        if (
+            vp2_cfg
+            and vp2_cfg.is_configured
+            and self._device_by_player.get("VP2") is None
+        ):
+            log.warning("VP2 nicht verbunden – später erneut versuchen.")
         return success and (self._device_by_player.get("VP1") is not None)
 
     def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Any:
-        delays = [1.0, 1.5, 2.0]
+        attempt_timeouts = [2.0, 3.5, 5.0]
+        attempts = len(attempt_timeouts)
         last_error: Optional[BaseException] = None
-        for attempt in range(1, 4):
-            log.info("Verbinde mit ip=%s, port=%s (Versuch %s/3)", cfg.ip, cfg.port, attempt)
+        for index, timeout in enumerate(attempt_timeouts, start=1):
+            log.info(
+                "Verbinde mit ip=%s, port=%s (Versuch %s/%s, Timeout %.1fs)",
+                cfg.ip,
+                cfg.port,
+                index,
+                attempts,
+                timeout,
+            )
             try:
                 device = self._connect_device_once(cfg)
-                return self._ensure_device_connection(device)
+                return self._ensure_device_connection(device, timeout=timeout)
             except Exception as exc:
                 last_error = exc
-                log.error("Verbindungsversuch %s/3 für %s fehlgeschlagen: %s", attempt, player, exc)
-                if attempt < 3:
-                    time.sleep(delays[attempt - 1])
+                log.error(
+                    "Verbindungsversuch %s/%s für %s fehlgeschlagen: %s",
+                    index,
+                    attempts,
+                    player,
+                    exc,
+                )
         raise last_error if last_error else RuntimeError("Unbekannter Verbindungsfehler")
+
+    def _make_device(self, ip: str, port: int) -> Any:
+        assert Device is not None  # guarded by caller
+        try:
+            return Device(address=ip, port=port)
+        except TypeError:
+            pass
+        try:
+            return Device(url=f"http://{ip}:{port}")
+        except TypeError:
+            pass
+        return Device(ip, port)
 
     def _connect_device_once(self, cfg: NeonDeviceConfig) -> Any:
         assert Device is not None  # guarded by caller
@@ -484,32 +527,26 @@ class PupilBridge:
 
         ip = cfg.ip
         port = int(cfg.port)
-        first_error: Optional[BaseException] = None
-        try:
-            return Device(ip, port)
-        except Exception as exc:
-            first_error = exc
-            log.error(
-                "Device(ip, port) fehlgeschlagen (%s) – versuche Keyword-Signatur.",
-                exc,
-            )
+        return self._make_device(ip, port)
 
-        try:
-            return Device(ip=ip, port=port)
-        except Exception as exc:
-            if first_error:
-                raise RuntimeError(
-                    f"Device konnte nicht initialisiert werden: {first_error}; {exc}"
-                ) from exc
-            raise
-
-    def _ensure_device_connection(self, device: Any) -> Any:
+    def _ensure_device_connection(self, device: Any, *, timeout: Optional[float] = None) -> Any:
         connect_fn = getattr(device, "connect", None)
         if callable(connect_fn):
-            try:
-                connect_fn()
-            except TypeError:
-                connect_fn(device)
+            variants = []
+            if timeout is not None:
+                variants.extend(
+                    [
+                        lambda: connect_fn(timeout=timeout),
+                        lambda: connect_fn(device, timeout=timeout),
+                    ]
+                )
+            variants.extend([lambda: connect_fn(), lambda: connect_fn(device)])
+            for variant in variants:
+                try:
+                    variant()
+                    break
+                except TypeError:
+                    continue
         return device
 
     def _close_device(self, device: Any) -> None:
@@ -1751,6 +1788,10 @@ class PupilBridge:
         """Close all connected devices if necessary."""
 
         self._event_router.flush_all()
+        try:
+            self._event_executor.shutdown(wait=False)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Failed to shutdown event executor", exc_info=True)
         for future in list(self._time_sync_tasks.values()):
             future.cancel()
             try:
@@ -2436,19 +2477,20 @@ class PupilBridge:
                 )
                 self._last_send_log = time.monotonic()
 
-    def _dispatch_event(
+    def _prepare_event_for_device(
         self,
         name: str,
         player: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send a single event to the device, falling back between APIs."""
+        """Prepare the event payload and dispatch asynchronously."""
+
         device = self._device_by_player.get(player)
         if device is None:
             return
 
         event_label = name
-        payload_json: Optional[str] = None
+        fallback_args: tuple[Any, ...] | None = (name, payload)
         if payload:
             try:
                 payload_json = json.dumps(payload, separators=(",", ":"), default=str)
@@ -2457,19 +2499,33 @@ class PupilBridge:
                 payload_json = json.dumps(safe_payload, separators=(",", ":"))
             event_label = f"{name}|{payload_json}"
 
-        try:
-            device.send_event(event_label)
-            return
-        except TypeError:
-            pass
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to send event %s for %s: %s", name, player, exc)
-            return
+        self._dispatch_event(device, event_label, fallback=fallback_args)
 
-        try:
-            device.send_event(name, payload)
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to send event %s for %s: %s", name, player, exc)
+    def _dispatch_event(
+        self,
+        device: Any,
+        event_label: str,
+        *,
+        fallback: tuple[Any, ...] | None = None,
+    ) -> None:
+        def _work() -> None:
+            try:
+                device.send_event(event_label)
+            except TypeError as exc:
+                if fallback is not None:
+                    try:
+                        device.send_event(*fallback)
+                        return
+                    except Exception as fallback_exc:  # pragma: no cover - hardware dependent
+                        self._log_error(
+                            f"[Failed to send event {event_label}] {fallback_exc}"
+                        )
+                        return
+                self._log_error(f"[Failed to send event {event_label}] {exc}")
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                self._log_error(f"[Failed to send event {event_label}] {exc}")
+
+        self._event_executor.submit(_work)
 
     def event_queue_load(self) -> tuple[int, int]:
         if self._event_queue is None:
@@ -2478,7 +2534,7 @@ class PupilBridge:
 
     def _dispatch_with_metrics(self, event: _QueuedEvent) -> None:
         try:
-            self._dispatch_event(event.name, event.player, event.payload)
+            self._prepare_event_for_device(event.name, event.player, event.payload)
         finally:
             t_dispatch_ns = time.perf_counter_ns()
             self._log_dispatch_latency(event, t_dispatch_ns)
