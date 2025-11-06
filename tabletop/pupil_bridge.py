@@ -663,6 +663,13 @@ class PupilBridge:
 
         effective_timeout = timeout if timeout is not None else self._connect_timeout
         if not self.wait_for_streaming(player, timeout=effective_timeout):
+            # Letzter Rettungsanker: Status-Heuristik
+            if self._status_indicates_video(player):
+                log.info(
+                    "Streaming-Timeout, aber Status OK – akzeptiere Video als 'running' (%s).",
+                    player,
+                )
+                return
             raise TimeoutError(f"Streamstart Timeout für {player}")
 
     def wait_for_streaming(
@@ -679,13 +686,11 @@ class PupilBridge:
 
         effective_timeout = timeout if timeout is not None else self._connect_timeout
         deadline = time.monotonic() + max(0.0, effective_timeout)
-        poll_delay = max(0.05, interval)
         while time.monotonic() < deadline:
             if self.is_streaming(player):
                 return True
-            time.sleep(poll_delay)
-
-        return self.is_streaming(player)
+            time.sleep(interval)
+        return False
 
     def _invoke_stream_start(self, player: str, device: Any) -> bool:
         methods = (
@@ -735,44 +740,40 @@ class PupilBridge:
         return False
 
     def _status_indicates_video(self, player: str) -> bool:
-        """Nutze Gerätestatus, um Video-Verfügbarkeit zu erkennen.
-
-        Akzeptiert Sensor-Einträge für world/eyes/gaze mit ``connected`` == True und
-        ohne ``stream_error``.
+        """
+        Interpretiert den zuletzt bekannten Status so, dass 'Video verfügbar' ist,
+        wenn die relevanten Sensoren (world/eyes/gaze) connected=True und
+        stream_error=False sind. Das deckt Neon 2.0 ab, wo es keinen separaten
+        Preview-Start/Flag gibt.
         """
 
         device = self._device_by_player.get(player)
         if device is None:
             return False
+
         status = self._get_device_status(device)
         if not status:
             return False
 
-        try:
-            items = (
-                status
-                if isinstance(status, list)
-                else status.get("items")
-                or status.get("data")
-                or []
-            )
-        except Exception:
-            items = []
+        items = (
+            status
+            if isinstance(status, list)
+            else (status.get("items") or status.get("data") or [])
+        )
 
         ok = False
         for entry in items:
-            if not isinstance(entry, dict):
+            try:
+                model = (entry.get("model") or "").lower()
+                data = entry.get("data") or {}
+                sensor = (str(data.get("sensor") or "")).lower()
+                if model == "sensor" and sensor in {"world", "eyes", "gaze"}:
+                    if bool(data.get("connected")) and not bool(
+                        data.get("stream_error")
+                    ):
+                        ok = True
+            except Exception:
                 continue
-            data = entry.get("data", {})
-            if not isinstance(data, dict):
-                continue
-            model = entry.get("model", "")
-            if model != "Sensor":
-                continue
-            sensor = str(data.get("sensor", "")).lower()
-            if sensor in {"world", "eyes", "gaze"}:
-                if bool(data.get("connected")) and not bool(data.get("stream_error")):
-                    ok = True
         return ok
 
     def _coerce_bool_value(self, value: Any) -> Optional[bool]:
@@ -847,6 +848,7 @@ class PupilBridge:
                     if coerced is not None:
                         return coerced
 
+        # letzter Fallback:
         return self._status_indicates_video(player)
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
