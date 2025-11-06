@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 _LOW_LATENCY_ENVS = ("LOW_LATENCY_DISABLED", "LOW_LATENCY_OFF")
 _PERF_ENVS = ("PERF_LOGGING", "TABLETOP_PERF")
+_EYE_START_ENV = "EYE_START_EXTERNALLY"
 _BATCH_WINDOW_ENV = "EVENT_BATCH_WINDOW_MS"
 _BATCH_SIZE_ENV = "EVENT_BATCH_SIZE"
 
@@ -140,6 +141,20 @@ def is_perf_logging_enabled() -> bool:
     return False
 
 
+def are_eye_trackers_managed_externally() -> bool:
+    """Return ``True`` if an external orchestrator is responsible for starting."""
+
+    value = os.environ.get(_EYE_START_ENV)
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return False
+
+
 def event_batch_window_override(default_seconds: float) -> float:
     """Return the batch window in seconds.
 
@@ -166,6 +181,7 @@ __all__ = [
     "get_latency_config",
     "is_low_latency_disabled",
     "is_perf_logging_enabled",
+    "are_eye_trackers_managed_externally",
     "event_batch_size_override",
     "event_batch_window_override",
 ]

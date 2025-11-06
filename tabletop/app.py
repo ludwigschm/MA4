@@ -42,6 +42,7 @@ from tabletop.pupil_bridge import PupilBridge
 from tabletop.engine import EventLogger
 from tabletop.sync.reconciler import TimeReconciler
 from tabletop.utils.runtime import (
+    are_eye_trackers_managed_externally,
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
@@ -844,19 +845,22 @@ def main(
     session: Optional[int] = None,
     block: Optional[int] = None,
     player: str = "auto",
+    bridge: Optional[PupilBridge] = None,
 ) -> None:
     """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
     logging_listener, logging_queue = _configure_async_logging()
 
-    bridge = PupilBridge()
-    try:
-        bridge.connect()
-    except Exception:  # pragma: no cover - defensive fallback
-        log.exception("Failed to connect to Pupil devices")
+    managed_externally = are_eye_trackers_managed_externally()
+    active_bridge = bridge if bridge is not None else PupilBridge()
+    if bridge is None or not managed_externally:
+        try:
+            active_bridge.connect()
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to connect to Pupil devices")
 
     try:
-        connected_players = bridge.connected_players()
+        connected_players = active_bridge.connected_players()
     except AttributeError:
         connected_players = set()
 
@@ -869,7 +873,7 @@ def main(
         block=block,
         player=player,
         players=desired_players,
-        bridge=bridge,
+        bridge=active_bridge,
         single_block_mode=single_block_mode,
         logging_queue=logging_queue,
     )
@@ -878,11 +882,11 @@ def main(
     finally:
         for tracked in desired_players:
             try:
-                bridge.stop_recording(tracked)
+                active_bridge.stop_recording(tracked)
             except Exception:  # pragma: no cover - defensive fallback
                 log.exception("Failed to stop recording during shutdown for %s", tracked)
         try:
-            bridge.close()
+            active_bridge.close()
         except Exception:  # pragma: no cover - defensive fallback
             log.exception("Failed to close Pupil bridge")
         if logging_listener is not None:

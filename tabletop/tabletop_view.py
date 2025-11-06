@@ -52,6 +52,7 @@ from metrics import create_latency_panel, default_latency_metrics
 from tabletop.utils.async_tasks import AsyncCallQueue
 from tabletop.utils.input_timing import Debouncer
 from tabletop.utils.runtime import (
+    are_eye_trackers_managed_externally,
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
@@ -190,6 +191,7 @@ class TabletopRoot(FloatLayout):
         self.fixation_runner = fixation_runner
         self.fixation_player = fixation_player
         self.fixation_tone_factory = fixation_tone_factory
+        self._bridge_autostart_enabled = not are_eye_trackers_managed_externally()
         self.bg_texture = resolve_background_texture()
         Window.bind(on_resize=self._on_window_resize)
         self.bind(size=self._update_scale)
@@ -275,9 +277,10 @@ class TabletopRoot(FloatLayout):
             block=bridge_block,
         )
         # kick recordings once Kivy has a chance to finish layout & session may be set
-        Clock.schedule_once(
-            lambda *_: self._ensure_bridge_recordings(force=True), 0.2
-        )
+        if self._bridge_autostart_enabled:
+            Clock.schedule_once(
+                lambda *_: self._ensure_bridge_recordings(force=True), 0.2
+            )
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -336,7 +339,7 @@ class TabletopRoot(FloatLayout):
         if players_snapshot and "VP2" not in players_snapshot:
             log.info("Nur VP1 aktiv – VP2 deaktiviert")
 
-        if bridge is not None:
+        if bridge is not None and self._bridge_autostart_enabled:
             def _kick_autostart(_dt: float) -> None:
                 bridge_ref = self._bridge
                 if bridge_ref is None:
@@ -356,7 +359,8 @@ class TabletopRoot(FloatLayout):
             Clock.schedule_once(_kick_autostart, 0.2)
 
         self._mark_bridge_dirty()
-        self._ensure_bridge_recordings()
+        if self._bridge_autostart_enabled:
+            self._ensure_bridge_recordings()
         self._ensure_time_reconciler()
         if self.session_configured:
             self._schedule_sync_heartbeat(immediate=False)
@@ -474,6 +478,8 @@ class TabletopRoot(FloatLayout):
             log.debug("Aktualisierung des Drift-Keepalive-Status fehlgeschlagen", exc_info=True)
 
     def _ensure_bridge_recordings(self, *_: Any, force: bool = False) -> None:
+        if not self._bridge_autostart_enabled:
+            return
         if not self._bridge or not self.session_configured:
             return
 
