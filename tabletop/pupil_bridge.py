@@ -152,6 +152,15 @@ class _ResyncBufferState:
         self.metrics = None
         self._buffer.clear()
 
+
+@dataclass
+class RecordingStartResult:
+    ok: bool
+    is_recording_active: bool
+    recording_id: Optional[str]
+    video_guid: Optional[str]
+    message: str
+
 class _BridgeDeviceClient(DeviceClient):
     """Adapter exposing async recording operations for :class:`RecordingController`."""
 
@@ -355,6 +364,9 @@ class PupilBridge:
             daemon=True,
         )
         self._async_thread.start()
+        self._status_cache: Dict[str, Dict[str, Any]] = {}
+        self._recording_start_inflight: Dict[str, bool] = {}
+        self._timesync_warned: set[str] = set()
         self._event_router = EventRouter(
             self._on_routed_event,
             batch_interval_s=self._event_batch_window,
@@ -648,6 +660,208 @@ class PupilBridge:
         self._probe_capabilities(player, cfg, device_id)
 
     # ------------------------------------------------------------------
+    # Recording start helpers
+    def _player_log_prefix(self, player: str) -> str:
+        index = self._PLAYER_INDICES.get(player.upper())
+        if index is not None:
+            return f"[p{index}]"
+        return f"[{player}]"
+
+    def _update_recording_status_cache(self, player: str) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {
+            "is_recording_active": None,
+            "recording_id": None,
+            "video_guid": None,
+            "time_sync_state": None,
+            "raw": None,
+            "updated_monotonic": time.monotonic(),
+        }
+        device = self._device_by_player.get(player)
+        if device is not None:
+            raw_status = self._get_device_status(device)
+            if raw_status is not None:
+                extracted = self._extract_recording_status_fields(raw_status)
+                snapshot.update(extracted)
+                snapshot["raw"] = raw_status
+        self._status_cache[player] = snapshot
+        return snapshot
+
+    def _extract_recording_status_fields(self, status: Any) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "is_recording_active": None,
+            "recording_id": None,
+            "video_guid": None,
+            "time_sync_state": None,
+        }
+
+        def normalise_identifier(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                stripped = value.strip()
+                return stripped or None
+            return str(value)
+
+        def inspect(obj: Any) -> None:
+            if isinstance(obj, dict):
+                if state["is_recording_active"] is None:
+                    coerced = self._coerce_bool_value(obj.get("is_recording_active"))
+                    if coerced is None:
+                        coerced = self._coerce_bool_value(obj.get("recording_active"))
+                    if coerced is not None:
+                        state["is_recording_active"] = coerced
+                if state["recording_id"] is None:
+                    for key in ("recording_id", "recordingId", "recording_uuid", "recordingUuid"):
+                        candidate = normalise_identifier(obj.get(key))
+                        if candidate:
+                            state["recording_id"] = candidate
+                            break
+                if state["video_guid"] is None:
+                    for key in ("video_guid", "videoGuid", "video_id", "videoId"):
+                        candidate = normalise_identifier(obj.get(key))
+                        if candidate:
+                            state["video_guid"] = candidate
+                            break
+                if state["time_sync_state"] is None:
+                    time_sync = obj.get("time_sync") or obj.get("timeSync")
+                    if isinstance(time_sync, dict):
+                        candidate = time_sync.get("status") or time_sync.get("state")
+                        if candidate:
+                            state["time_sync_state"] = str(candidate)
+                    elif isinstance(time_sync, str) and time_sync:
+                        state["time_sync_state"] = time_sync
+                    else:
+                        for key in (
+                            "time_sync_status",
+                            "timeSyncStatus",
+                            "time_sync_state",
+                            "timeSyncState",
+                        ):
+                            candidate = obj.get(key)
+                            if candidate:
+                                state["time_sync_state"] = str(candidate)
+                                break
+                nested = obj.get("data")
+                if nested is not None:
+                    inspect(nested)
+                nested_recording = obj.get("recording")
+                if nested_recording is not None:
+                    inspect(nested_recording)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    inspect(item)
+
+        inspect(status)
+        return state
+
+    def _get_cached_recording_status(self, player: str) -> Dict[str, Any]:
+        cached = self._status_cache.get(player)
+        if cached is None:
+            return self._update_recording_status_cache(player)
+        return cached
+
+    def _send_recording_broadcast(self, player: str, label: str) -> bool:
+        payload = {"action": "start", "label": label}
+        try:
+            self.send_event("broadcast.start", player, payload, priority="high")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log.warning(
+                "%s broadcast start send failed: %s",
+                self._player_log_prefix(player),
+                exc,
+            )
+            return False
+        return True
+
+    def start_recording(
+        self, player: str, label: str, timeout: float = 10.0
+    ) -> RecordingStartResult:
+        prefix = self._player_log_prefix(player)
+        device = self._device_by_player.get(player)
+        if device is None:
+            message = "device not connected"
+            log.error("%s %s", prefix, message)
+            return RecordingStartResult(False, False, None, None, message)
+
+        snapshot = self._get_cached_recording_status(player)
+        is_active = self._coerce_bool_value(snapshot.get("is_recording_active"))
+        recording_id = snapshot.get("recording_id")
+        video_guid = snapshot.get("video_guid")
+
+        if is_active:
+            log.info("%s already recording; skipping", prefix)
+            self._active_recording[player] = True
+            self._start_drift_keepalive(player)
+            return RecordingStartResult(True, True, recording_id, video_guid, "already active")
+
+        if self._recording_start_inflight.get(player):
+            log.info("%s start already in-flight; skipping", prefix)
+            return RecordingStartResult(True, bool(is_active), recording_id, video_guid, "in-flight")
+
+        self._recording_start_inflight[player] = True
+        warn_key = f"{player}:empty"
+        try:
+            broadcast_ok = self._send_recording_broadcast(player, label)
+            snapshot = self._update_recording_status_cache(player)
+            is_active_now = self._coerce_bool_value(snapshot.get("is_recording_active"))
+            recording_id = snapshot.get("recording_id")
+            video_guid = snapshot.get("video_guid")
+            log.info(
+                "%s broadcast start -> ok=%s | is_recording_active(now)=%s | label=%s | rec_id=%s | video_guid=%s",
+                prefix,
+                broadcast_ok,
+                bool(is_active_now),
+                label,
+                recording_id,
+                video_guid,
+            )
+            if not broadcast_ok:
+                message = "broadcast start failed"
+                return RecordingStartResult(False, bool(is_active_now), recording_id, video_guid, message)
+
+            poll_interval = min(0.25, max(0.1, timeout / 20.0 if timeout > 0 else 0.1))
+            deadline = time.monotonic() + max(0.0, timeout)
+
+            while time.monotonic() < deadline:
+                snapshot = self._get_cached_recording_status(player)
+                time_sync_state = snapshot.get("time_sync_state")
+                if (
+                    isinstance(time_sync_state, str)
+                    and time_sync_state.strip().lower() == "empty"
+                    and warn_key not in self._timesync_warned
+                ):
+                    log.warning("%s time sync status empty during start", prefix)
+                    self._timesync_warned.add(warn_key)
+                is_active_loop = self._coerce_bool_value(
+                    snapshot.get("is_recording_active")
+                )
+                if is_active_loop:
+                    recording_id = snapshot.get("recording_id")
+                    video_guid = snapshot.get("video_guid")
+                    log.info("%s is_recording_active=True", prefix)
+                    metadata = {
+                        "player": player,
+                        "recording_label": label,
+                        "recording_id": recording_id,
+                    }
+                    if video_guid:
+                        metadata["video_guid"] = video_guid
+                    self._finalise_recording_start(player, metadata)
+                    log.info("%s Recording CONFIRM=True", prefix)
+                    return RecordingStartResult(True, True, recording_id, video_guid, "recording active")
+                time.sleep(poll_interval)
+                self._update_recording_status_cache(player)
+
+            snapshot = self._get_cached_recording_status(player)
+            recording_id = snapshot.get("recording_id")
+            video_guid = snapshot.get("video_guid")
+            message = "timeout waiting for recording confirmation"
+            log.error("%s %s", prefix, message)
+            return RecordingStartResult(False, False, recording_id, video_guid, message)
+        finally:
+            self._recording_start_inflight.pop(player, None)
+            self._timesync_warned.discard(warn_key)
+
     # Streaming helpers
     def start_streaming(self, player: str, *, timeout: Optional[float] = None) -> None:
         """Start the preview/stream for the given player if possible."""
@@ -2636,4 +2850,4 @@ class PupilBridge:
         return str(value)
 
 
-__all__ = ["PupilBridge", "NeonDeviceConfig"]
+__all__ = ["PupilBridge", "NeonDeviceConfig", "RecordingStartResult"]
