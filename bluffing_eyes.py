@@ -75,12 +75,25 @@ def start_eye_trackers_sequence(
             if not bridge.is_connected(current):
                 raise RuntimeError(f"{current} ist nicht verbunden")
 
-        def _start_stream(player_id: str, *, timeout: float = 5.0) -> None:
+        def _start_stream(player_id: str, *, timeout: float = 8.0) -> None:
             cfg = configs[player_id]
             endpoint = cfg.address or cfg.ip or "-"
             log.info("Starte Video/Stream auf %s (%s)", player_id, endpoint)
             try:
                 bridge.start_streaming(player_id, timeout=timeout)
+            except TimeoutError as exc:
+                try:
+                    if bridge.is_streaming(player_id):
+                        log.warning(
+                            "Streaming-Timeout, aber Status OK – fahre fort (%s).",
+                            player_id,
+                        )
+                        return
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Streamstart für {player_id} fehlgeschlagen: {exc}"
+                ) from exc
             except Exception as exc:
                 if bridge.is_streaming(player_id):
                     log.warning(
