@@ -481,6 +481,122 @@ class PupilBridge:
             log.warning("VP2 nicht verbunden – später erneut versuchen.")
         return success and (self._device_by_player.get("VP1") is not None)
 
+    def _candidate_endpoints(
+        self, player: str, cfg: Optional[NeonDeviceConfig] = None
+    ) -> list[tuple[str, int]]:
+        """
+        Liefert (ip, port)-Kandidaten aus der aktuellen Statusmeldung + Konfig.
+        Reihenfolge: konfigurierte IP zuerst, dann alle NetworkDevice-Einträge mit passender
+        device_id, danach evtl. Alternativ-IP aus get_status.
+        """
+
+        candidates: list[tuple[str, int]] = []
+        cfg = cfg or self._device_config.get(player)
+        if cfg and cfg.ip and cfg.port is not None and not cfg.port_invalid:
+            candidates.append((cfg.ip, int(cfg.port)))
+
+        device = self._device_by_player.get(player)
+        status = self._get_device_status(device) if device else None
+        if isinstance(status, list):
+            items: Iterable[Any] = status
+        elif isinstance(status, dict):
+            raw_items = status.get("items") or status.get("data") or []
+            if isinstance(raw_items, dict):
+                items = raw_items.values()
+            elif isinstance(raw_items, (list, tuple)):
+                items = raw_items
+            else:
+                items = []
+        else:
+            items = []
+
+        wanted_id: Optional[str] = None
+        if cfg:
+            wanted_id = getattr(cfg, "id", None) or getattr(cfg, "device_id", None)
+
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            model = (entry.get("model") or "").lower()
+            if model != "networkdevice":
+                continue
+            data = entry.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            if wanted_id and data.get("device_id") != wanted_id:
+                continue
+            ip_value, port_value = self._parse_network_value(data)
+            if not ip_value:
+                ip_value, port_value = self._parse_network_value(data.get("address"))
+            if not ip_value:
+                continue
+            port_int = port_value if port_value is not None else 8080
+            candidate = (ip_value, int(port_int))
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        alt_ip, alt_port = self._extract_ip_port(device, status) if status is not None else (None, None)
+        if alt_ip:
+            if alt_port is None:
+                default_port = cfg.port if cfg and cfg.port is not None else 8080
+                alt_port = default_port
+            coerced_port = (
+                alt_port
+                if isinstance(alt_port, int)
+                else self._coerce_port(alt_port)
+            )
+            if coerced_port is None:
+                coerced_port = 8080
+            candidates.append((alt_ip, int(coerced_port)))
+
+        seen: set[tuple[str, int]] = set()
+        uniq: list[tuple[str, int]] = []
+        for ip, port in candidates:
+            key = (ip, port)
+            if key in seen:
+                continue
+            uniq.append(key)
+            seen.add(key)
+        return uniq
+
+    def _open_device(self, ip: str, port: int, *, connect_timeout: float) -> Any:
+        """
+        Baut ein Device-Objekt. Die Simple-API erwartet i. d. R. eine Address-URL oder
+        mindestens positionsbasierte Parameter – keine Keywords.
+        """
+
+        assert Device is not None  # guarded by caller
+        try:
+            return Device(ip, port, connect_timeout=connect_timeout)
+        except TypeError:
+            pass
+        try:
+            return Device(f"{ip}:{port}", connect_timeout=connect_timeout)
+        except TypeError:
+            return Device(ip, connect_timeout=connect_timeout)
+
+    def _connect_player(self, player: str, cfg: NeonDeviceConfig) -> Any:
+        timeout = self._connect_timeout
+        last_exc: Optional[BaseException] = None
+        endpoints = self._candidate_endpoints(player, cfg)
+        if not endpoints:
+            raise RuntimeError(f"Keine Endpunkte für {player} verfügbar")
+        for ip, port in endpoints:
+            try:
+                log.info("Verbinde mit ip=%s, port=%s (%s)", ip, port, player)
+                device = self._open_device(ip, port, connect_timeout=timeout)
+                prepared = self._ensure_device_connection(device)
+                cfg.ip = ip
+                cfg.port = port
+                cfg.port_invalid = False
+                return prepared
+            except Exception as exc:
+                last_exc = exc
+                log.error(
+                    "Verbindung zu %s (%s:%s) fehlgeschlagen: %s", player, ip, port, exc
+                )
+        raise RuntimeError(f"[Verbindung zu {player} fehlgeschlagen] {last_exc}")
+
     def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Any:
         attempt_timeouts = [2.0, 3.5, 5.0]
         attempts = len(attempt_timeouts)
@@ -1831,16 +1947,12 @@ class PupilBridge:
             self._event_queue = None
             self._sender_thread = None
         for player, device in list(self._device_by_player.items()):
-            if device is None:
-                continue
-            try:
-                close_fn = getattr(device, "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception as exc:  # pragma: no cover - hardware dependent
-                log.exception("Failed to close device for %s: %s", player, exc)
-            finally:
-                self._device_by_player[player] = None
+            if device is not None:
+                try:
+                    self._close_device(device)
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    log.exception("Failed to close device for %s: %s", player, exc)
+            self._device_by_player[player] = None
         for player in list(self._active_recording):
             self._active_recording[player] = False
             self._stop_drift_keepalive(player)
