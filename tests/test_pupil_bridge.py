@@ -17,7 +17,7 @@ class _FakeDevice:
         self.offset_samples = [0.01 + i * 0.0005 for i in range(20)]
         self._notifications: dict[str, object] = {"recording.begin": {"recording_id": "fake"}}
 
-    def recording_start(self) -> None:
+    def recording_start(self, *, label: str | None = None) -> None:
         self.start_calls += 1
 
     def recording_stop(self) -> None:  # pragma: no cover - defensive
@@ -77,8 +77,11 @@ def test_high_priority_prefix_enforced(monkeypatch: pytest.MonkeyPatch, bridge) 
 
 def test_recording_start_idempotent(bridge):
     pupil_bridge, device = bridge
-    pupil_bridge.start_recording(1, 1, "VP1")
-    pupil_bridge.start_recording(1, 1, "VP1")
+    label = "game|-|-|VP1|test"
+    result1 = pupil_bridge.start_recording(player="VP1", label=label)
+    result2 = pupil_bridge.start_recording(player="VP1", label=label)
+    assert result1.ok is True
+    assert result2.ok is True
     assert device.start_calls == 1
 
 

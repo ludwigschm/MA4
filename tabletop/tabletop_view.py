@@ -517,11 +517,24 @@ class TabletopRoot(FloatLayout):
             self._next_bridge_check = now + self._bridge_check_interval
             return
 
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
         for player in players:
             if player in self._bridge_recordings_active:
                 continue
-            self._bridge.start_recording(session_value, block_value, player)
-            self._bridge_recordings_active.add(player)
+            session_part = str(session_value) if session_value is not None else "-"
+            block_part = str(block_value) if block_value is not None else "-"
+            label = "|".join(["game", session_part, block_part, player, timestamp])
+            result = self._bridge.start_recording(player=player, label=label)
+            if result.ok and result.is_recording_active:
+                self._bridge_recordings_active.add(player)
+            else:
+                log.warning(
+                    "Bridge recording start failed player=%s ok=%s active=%s msg=%s",
+                    player,
+                    result.ok,
+                    result.is_recording_active,
+                    result.message,
+                )
 
         if self._bridge_recordings_active:
             self._bridge_recording_block = block_value
