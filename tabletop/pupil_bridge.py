@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, Literal, Optional, Tuple, Union
@@ -27,10 +28,17 @@ from core.time_sync import (
 )
 
 try:  # pragma: no cover - optional dependency
-    from pupil_labs.realtime_api.simple import Device, discover_devices
+    from pupil_labs.realtime_api.simple import discover_devices
 except Exception:  # pragma: no cover - optional dependency
-    Device = None  # type: ignore[assignment]
     discover_devices = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
+    from pupil_labs.realtime_api.simple.device import Device
+except Exception:  # pragma: no cover - optional dependency
+    try:  # fallback for legacy API surface
+        from pupil_labs.realtime_api.simple import Device  # type: ignore[assignment]
+    except Exception:  # pragma: no cover - optional dependency
+        Device = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
     import requests
@@ -151,6 +159,15 @@ class _ResyncBufferState:
         self.device_id = ""
         self.metrics = None
         self._buffer.clear()
+
+
+@dataclass
+class RecordingStartResult:
+    ok: bool
+    is_recording_active: bool
+    recording_id: Optional[str]
+    video_guid: Optional[str]
+    message: str
 
 class _BridgeDeviceClient(DeviceClient):
     """Adapter exposing async recording operations for :class:`RecordingController`."""
@@ -355,12 +372,16 @@ class PupilBridge:
             daemon=True,
         )
         self._async_thread.start()
+        self._status_cache: Dict[str, Dict[str, Any]] = {}
+        self._recording_start_inflight: Dict[str, bool] = {}
+        self._timesync_warned: set[str] = set()
         self._event_router = EventRouter(
             self._on_routed_event,
             batch_interval_s=self._event_batch_window,
             max_batch=self._event_batch_size,
             multi_route=False,
         )
+        self._event_executor = ThreadPoolExecutor(max_workers=2)
         self._external_start = are_eye_trackers_managed_externally()
         self._event_router.set_active_player("VP1")
         self._active_router_player = "VP1"
@@ -375,6 +396,9 @@ class PupilBridge:
 
     # ---------------------------------------------------------------------
     # Lifecycle management
+    def _log_error(self, message: str) -> None:
+        log.error(message)
+
     def connect(self) -> bool:
         """Discover or configure devices and map them to configured players."""
 
@@ -448,22 +472,53 @@ class PupilBridge:
 
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
+        vp2_cfg = self._device_config.get("VP2")
+        if (
+            vp2_cfg
+            and vp2_cfg.is_configured
+            and self._device_by_player.get("VP2") is None
+        ):
+            log.warning("VP2 nicht verbunden – später erneut versuchen.")
         return success and (self._device_by_player.get("VP1") is not None)
 
     def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Any:
-        delays = [1.0, 1.5, 2.0]
+        attempt_timeouts = [2.0, 3.5, 5.0]
+        attempts = len(attempt_timeouts)
         last_error: Optional[BaseException] = None
-        for attempt in range(1, 4):
-            log.info("Verbinde mit ip=%s, port=%s (Versuch %s/3)", cfg.ip, cfg.port, attempt)
+        for index, timeout in enumerate(attempt_timeouts, start=1):
+            log.info(
+                "Verbinde mit ip=%s, port=%s (Versuch %s/%s, Timeout %.1fs)",
+                cfg.ip,
+                cfg.port,
+                index,
+                attempts,
+                timeout,
+            )
             try:
                 device = self._connect_device_once(cfg)
-                return self._ensure_device_connection(device)
+                return self._ensure_device_connection(device, timeout=timeout)
             except Exception as exc:
                 last_error = exc
-                log.error("Verbindungsversuch %s/3 für %s fehlgeschlagen: %s", attempt, player, exc)
-                if attempt < 3:
-                    time.sleep(delays[attempt - 1])
+                log.error(
+                    "Verbindungsversuch %s/%s für %s fehlgeschlagen: %s",
+                    index,
+                    attempts,
+                    player,
+                    exc,
+                )
         raise last_error if last_error else RuntimeError("Unbekannter Verbindungsfehler")
+
+    def _make_device(self, ip: str, port: int) -> Any:
+        assert Device is not None  # guarded by caller
+        try:
+            return Device(address=ip, port=port)
+        except TypeError:
+            pass
+        try:
+            return Device(url=f"http://{ip}:{port}")
+        except TypeError:
+            pass
+        return Device(ip, port)
 
     def _connect_device_once(self, cfg: NeonDeviceConfig) -> Any:
         assert Device is not None  # guarded by caller
@@ -472,32 +527,26 @@ class PupilBridge:
 
         ip = cfg.ip
         port = int(cfg.port)
-        first_error: Optional[BaseException] = None
-        try:
-            return Device(ip, port)
-        except Exception as exc:
-            first_error = exc
-            log.error(
-                "Device(ip, port) fehlgeschlagen (%s) – versuche Keyword-Signatur.",
-                exc,
-            )
+        return self._make_device(ip, port)
 
-        try:
-            return Device(ip=ip, port=port)
-        except Exception as exc:
-            if first_error:
-                raise RuntimeError(
-                    f"Device konnte nicht initialisiert werden: {first_error}; {exc}"
-                ) from exc
-            raise
-
-    def _ensure_device_connection(self, device: Any) -> Any:
+    def _ensure_device_connection(self, device: Any, *, timeout: Optional[float] = None) -> Any:
         connect_fn = getattr(device, "connect", None)
         if callable(connect_fn):
-            try:
-                connect_fn()
-            except TypeError:
-                connect_fn(device)
+            variants = []
+            if timeout is not None:
+                variants.extend(
+                    [
+                        lambda: connect_fn(timeout=timeout),
+                        lambda: connect_fn(device, timeout=timeout),
+                    ]
+                )
+            variants.extend([lambda: connect_fn(), lambda: connect_fn(device)])
+            for variant in variants:
+                try:
+                    variant()
+                    break
+                except TypeError:
+                    continue
         return device
 
     def _close_device(self, device: Any) -> None:
@@ -648,6 +697,208 @@ class PupilBridge:
         self._probe_capabilities(player, cfg, device_id)
 
     # ------------------------------------------------------------------
+    # Recording start helpers
+    def _player_log_prefix(self, player: str) -> str:
+        index = self._PLAYER_INDICES.get(player.upper())
+        if index is not None:
+            return f"[p{index}]"
+        return f"[{player}]"
+
+    def _update_recording_status_cache(self, player: str) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {
+            "is_recording_active": None,
+            "recording_id": None,
+            "video_guid": None,
+            "time_sync_state": None,
+            "raw": None,
+            "updated_monotonic": time.monotonic(),
+        }
+        device = self._device_by_player.get(player)
+        if device is not None:
+            raw_status = self._get_device_status(device)
+            if raw_status is not None:
+                extracted = self._extract_recording_status_fields(raw_status)
+                snapshot.update(extracted)
+                snapshot["raw"] = raw_status
+        self._status_cache[player] = snapshot
+        return snapshot
+
+    def _extract_recording_status_fields(self, status: Any) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "is_recording_active": None,
+            "recording_id": None,
+            "video_guid": None,
+            "time_sync_state": None,
+        }
+
+        def normalise_identifier(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                stripped = value.strip()
+                return stripped or None
+            return str(value)
+
+        def inspect(obj: Any) -> None:
+            if isinstance(obj, dict):
+                if state["is_recording_active"] is None:
+                    coerced = self._coerce_bool_value(obj.get("is_recording_active"))
+                    if coerced is None:
+                        coerced = self._coerce_bool_value(obj.get("recording_active"))
+                    if coerced is not None:
+                        state["is_recording_active"] = coerced
+                if state["recording_id"] is None:
+                    for key in ("recording_id", "recordingId", "recording_uuid", "recordingUuid"):
+                        candidate = normalise_identifier(obj.get(key))
+                        if candidate:
+                            state["recording_id"] = candidate
+                            break
+                if state["video_guid"] is None:
+                    for key in ("video_guid", "videoGuid", "video_id", "videoId"):
+                        candidate = normalise_identifier(obj.get(key))
+                        if candidate:
+                            state["video_guid"] = candidate
+                            break
+                if state["time_sync_state"] is None:
+                    time_sync = obj.get("time_sync") or obj.get("timeSync")
+                    if isinstance(time_sync, dict):
+                        candidate = time_sync.get("status") or time_sync.get("state")
+                        if candidate:
+                            state["time_sync_state"] = str(candidate)
+                    elif isinstance(time_sync, str) and time_sync:
+                        state["time_sync_state"] = time_sync
+                    else:
+                        for key in (
+                            "time_sync_status",
+                            "timeSyncStatus",
+                            "time_sync_state",
+                            "timeSyncState",
+                        ):
+                            candidate = obj.get(key)
+                            if candidate:
+                                state["time_sync_state"] = str(candidate)
+                                break
+                nested = obj.get("data")
+                if nested is not None:
+                    inspect(nested)
+                nested_recording = obj.get("recording")
+                if nested_recording is not None:
+                    inspect(nested_recording)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    inspect(item)
+
+        inspect(status)
+        return state
+
+    def _get_cached_recording_status(self, player: str) -> Dict[str, Any]:
+        cached = self._status_cache.get(player)
+        if cached is None:
+            return self._update_recording_status_cache(player)
+        return cached
+
+    def _send_recording_broadcast(self, player: str, label: str) -> bool:
+        payload = {"action": "start", "label": label}
+        try:
+            self.send_event("broadcast.start", player, payload, priority="high")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log.warning(
+                "%s broadcast start send failed: %s",
+                self._player_log_prefix(player),
+                exc,
+            )
+            return False
+        return True
+
+    def start_recording(
+        self, player: str, label: str, timeout: float = 10.0
+    ) -> RecordingStartResult:
+        prefix = self._player_log_prefix(player)
+        device = self._device_by_player.get(player)
+        if device is None:
+            message = "device not connected"
+            log.error("%s %s", prefix, message)
+            return RecordingStartResult(False, False, None, None, message)
+
+        snapshot = self._get_cached_recording_status(player)
+        is_active = self._coerce_bool_value(snapshot.get("is_recording_active"))
+        recording_id = snapshot.get("recording_id")
+        video_guid = snapshot.get("video_guid")
+
+        if is_active:
+            log.info("%s already recording; skipping", prefix)
+            self._active_recording[player] = True
+            self._start_drift_keepalive(player)
+            return RecordingStartResult(True, True, recording_id, video_guid, "already active")
+
+        if self._recording_start_inflight.get(player):
+            log.info("%s start already in-flight; skipping", prefix)
+            return RecordingStartResult(True, bool(is_active), recording_id, video_guid, "in-flight")
+
+        self._recording_start_inflight[player] = True
+        warn_key = f"{player}:empty"
+        try:
+            broadcast_ok = self._send_recording_broadcast(player, label)
+            snapshot = self._update_recording_status_cache(player)
+            is_active_now = self._coerce_bool_value(snapshot.get("is_recording_active"))
+            recording_id = snapshot.get("recording_id")
+            video_guid = snapshot.get("video_guid")
+            log.info(
+                "%s broadcast start -> ok=%s | is_recording_active(now)=%s | label=%s | rec_id=%s | video_guid=%s",
+                prefix,
+                broadcast_ok,
+                bool(is_active_now),
+                label,
+                recording_id,
+                video_guid,
+            )
+            if not broadcast_ok:
+                message = "broadcast start failed"
+                return RecordingStartResult(False, bool(is_active_now), recording_id, video_guid, message)
+
+            poll_interval = min(0.25, max(0.1, timeout / 20.0 if timeout > 0 else 0.1))
+            deadline = time.monotonic() + max(0.0, timeout)
+
+            while time.monotonic() < deadline:
+                snapshot = self._get_cached_recording_status(player)
+                time_sync_state = snapshot.get("time_sync_state")
+                if (
+                    isinstance(time_sync_state, str)
+                    and time_sync_state.strip().lower() == "empty"
+                    and warn_key not in self._timesync_warned
+                ):
+                    log.warning("%s time sync status empty during start", prefix)
+                    self._timesync_warned.add(warn_key)
+                is_active_loop = self._coerce_bool_value(
+                    snapshot.get("is_recording_active")
+                )
+                if is_active_loop:
+                    recording_id = snapshot.get("recording_id")
+                    video_guid = snapshot.get("video_guid")
+                    log.info("%s is_recording_active=True", prefix)
+                    metadata = {
+                        "player": player,
+                        "recording_label": label,
+                        "recording_id": recording_id,
+                    }
+                    if video_guid:
+                        metadata["video_guid"] = video_guid
+                    self._finalise_recording_start(player, metadata)
+                    log.info("%s Recording CONFIRM=True", prefix)
+                    return RecordingStartResult(True, True, recording_id, video_guid, "recording active")
+                time.sleep(poll_interval)
+                self._update_recording_status_cache(player)
+
+            snapshot = self._get_cached_recording_status(player)
+            recording_id = snapshot.get("recording_id")
+            video_guid = snapshot.get("video_guid")
+            message = "timeout waiting for recording confirmation"
+            log.error("%s %s", prefix, message)
+            return RecordingStartResult(False, False, recording_id, video_guid, message)
+        finally:
+            self._recording_start_inflight.pop(player, None)
+            self._timesync_warned.discard(warn_key)
+
     # Streaming helpers
     def start_streaming(self, player: str, *, timeout: Optional[float] = None) -> None:
         """Start the preview/stream for the given player if possible."""
@@ -1537,6 +1788,10 @@ class PupilBridge:
         """Close all connected devices if necessary."""
 
         self._event_router.flush_all()
+        try:
+            self._event_executor.shutdown(wait=False)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Failed to shutdown event executor", exc_info=True)
         for future in list(self._time_sync_tasks.values()):
             future.cancel()
             try:
@@ -2222,19 +2477,20 @@ class PupilBridge:
                 )
                 self._last_send_log = time.monotonic()
 
-    def _dispatch_event(
+    def _prepare_event_for_device(
         self,
         name: str,
         player: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send a single event to the device, falling back between APIs."""
+        """Prepare the event payload and dispatch asynchronously."""
+
         device = self._device_by_player.get(player)
         if device is None:
             return
 
         event_label = name
-        payload_json: Optional[str] = None
+        fallback_args: tuple[Any, ...] | None = (name, payload)
         if payload:
             try:
                 payload_json = json.dumps(payload, separators=(",", ":"), default=str)
@@ -2243,19 +2499,33 @@ class PupilBridge:
                 payload_json = json.dumps(safe_payload, separators=(",", ":"))
             event_label = f"{name}|{payload_json}"
 
-        try:
-            device.send_event(event_label)
-            return
-        except TypeError:
-            pass
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to send event %s for %s: %s", name, player, exc)
-            return
+        self._dispatch_event(device, event_label, fallback=fallback_args)
 
-        try:
-            device.send_event(name, payload)
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to send event %s for %s: %s", name, player, exc)
+    def _dispatch_event(
+        self,
+        device: Any,
+        event_label: str,
+        *,
+        fallback: tuple[Any, ...] | None = None,
+    ) -> None:
+        def _work() -> None:
+            try:
+                device.send_event(event_label)
+            except TypeError as exc:
+                if fallback is not None:
+                    try:
+                        device.send_event(*fallback)
+                        return
+                    except Exception as fallback_exc:  # pragma: no cover - hardware dependent
+                        self._log_error(
+                            f"[Failed to send event {event_label}] {fallback_exc}"
+                        )
+                        return
+                self._log_error(f"[Failed to send event {event_label}] {exc}")
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                self._log_error(f"[Failed to send event {event_label}] {exc}")
+
+        self._event_executor.submit(_work)
 
     def event_queue_load(self) -> tuple[int, int]:
         if self._event_queue is None:
@@ -2264,7 +2534,7 @@ class PupilBridge:
 
     def _dispatch_with_metrics(self, event: _QueuedEvent) -> None:
         try:
-            self._dispatch_event(event.name, event.player, event.payload)
+            self._prepare_event_for_device(event.name, event.player, event.payload)
         finally:
             t_dispatch_ns = time.perf_counter_ns()
             self._log_dispatch_latency(event, t_dispatch_ns)
@@ -2636,4 +2906,4 @@ class PupilBridge:
         return str(value)
 
 
-__all__ = ["PupilBridge", "NeonDeviceConfig"]
+__all__ = ["PupilBridge", "NeonDeviceConfig", "RecordingStartResult"]
