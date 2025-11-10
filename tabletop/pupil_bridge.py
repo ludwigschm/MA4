@@ -167,7 +167,7 @@ class RecordingStartResult:
     is_recording_active: bool
     recording_id: Optional[str]
     video_guid: Optional[str]
-    message: str
+    message: str = ""
 
 class _BridgeDeviceClient(DeviceClient):
     """Adapter exposing async recording operations for :class:`RecordingController`."""
@@ -936,6 +936,16 @@ class PupilBridge:
             log.error("%s %s", prefix, message)
             return RecordingStartResult(False, False, None, None, message)
 
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            cfg = self._device_config.get(player)
+            if cfg is None:
+                message = "device config missing"
+                log.error("%s %s", prefix, message)
+                return RecordingStartResult(False, False, None, None, message)
+            controller = self._build_recording_controller(player, device, cfg)
+            self._recording_controllers[player] = controller
+
         snapshot = self._get_cached_recording_status(player)
         is_active = self._coerce_bool_value(snapshot.get("is_recording_active"))
         recording_id = snapshot.get("recording_id")
@@ -953,24 +963,68 @@ class PupilBridge:
 
         self._recording_start_inflight[player] = True
         warn_key = f"{player}:empty"
+
+        def _latest_ids() -> tuple[Optional[str], Optional[str]]:
+            current = self._get_cached_recording_status(player)
+            return current.get("recording_id"), current.get("video_guid")
+
         try:
             broadcast_ok = self._send_recording_broadcast(player, label)
             snapshot = self._update_recording_status_cache(player)
-            is_active_now = self._coerce_bool_value(snapshot.get("is_recording_active"))
             recording_id = snapshot.get("recording_id")
             video_guid = snapshot.get("video_guid")
             log.info(
                 "%s broadcast start -> ok=%s | is_recording_active(now)=%s | label=%s | rec_id=%s | video_guid=%s",
                 prefix,
                 broadcast_ok,
-                bool(is_active_now),
+                bool(self._coerce_bool_value(snapshot.get("is_recording_active"))),
                 label,
                 recording_id,
                 video_guid,
             )
             if not broadcast_ok:
                 message = "broadcast start failed"
-                return RecordingStartResult(False, bool(is_active_now), recording_id, video_guid, message)
+                return RecordingStartResult(False, False, recording_id, video_guid, message)
+
+            start_future = self._schedule_recording_start(player, controller, label)
+            try:
+                start_future.result(timeout=max(1.0, timeout))
+            except RecordingHttpError as exc:
+                lowered = (exc.message or "").lower()
+                if exc.status == 400 and "already recording" in lowered:
+                    log.info("%s already recording (controller 400)", prefix)
+                    self._active_recording[player] = True
+                    self._start_drift_keepalive(player)
+                    recording_id, video_guid = _latest_ids()
+                    return RecordingStartResult(
+                        True,
+                        True,
+                        recording_id,
+                        video_guid,
+                        exc.message or "already recording",
+                    )
+                message = f"recording start failed ({exc.status}): {exc.message}"
+                log.warning("%s %s", prefix, message)
+                recording_id, video_guid = _latest_ids()
+                return RecordingStartResult(False, False, recording_id, video_guid, message)
+            except asyncio.TimeoutError:
+                message = "recording start timeout"
+                log.warning("%s %s", prefix, message)
+                recording_id, video_guid = _latest_ids()
+                return RecordingStartResult(False, False, recording_id, video_guid, message)
+            except Exception as exc:  # pragma: no cover - defensive
+                message = f"recording start error: {exc}"
+                log.warning("%s %s", prefix, message)
+                recording_id, video_guid = _latest_ids()
+                return RecordingStartResult(False, False, recording_id, video_guid, message)
+
+            controller_active = False
+            try:
+                controller_active = asyncio.run_coroutine_threadsafe(
+                    controller.is_recording(), self._async_loop
+                ).result(timeout=max(0.5, min(timeout, 5.0)))
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("%s controller.is_recording failed: %s", prefix, exc, exc_info=True)
 
             poll_interval = min(0.25, max(0.1, timeout / 20.0 if timeout > 0 else 0.1))
             deadline = time.monotonic() + max(0.0, timeout)
@@ -985,13 +1039,13 @@ class PupilBridge:
                 ):
                     log.warning("%s time sync status empty during start", prefix)
                     self._timesync_warned.add(warn_key)
+
+                recording_id = snapshot.get("recording_id")
+                video_guid = snapshot.get("video_guid")
                 is_active_loop = self._coerce_bool_value(
                     snapshot.get("is_recording_active")
                 )
-                if is_active_loop:
-                    recording_id = snapshot.get("recording_id")
-                    video_guid = snapshot.get("video_guid")
-                    log.info("%s is_recording_active=True", prefix)
+                if is_active_loop or controller_active or self._active_recording.get(player):
                     metadata = {
                         "player": player,
                         "recording_label": label,
@@ -1002,12 +1056,26 @@ class PupilBridge:
                     self._finalise_recording_start(player, metadata)
                     log.info("%s Recording CONFIRM=True", prefix)
                     return RecordingStartResult(True, True, recording_id, video_guid, "recording active")
+
                 time.sleep(poll_interval)
                 self._update_recording_status_cache(player)
 
             snapshot = self._get_cached_recording_status(player)
             recording_id = snapshot.get("recording_id")
             video_guid = snapshot.get("video_guid")
+            if controller_active or self._active_recording.get(player):
+                metadata = {
+                    "player": player,
+                    "recording_label": label,
+                    "recording_id": recording_id,
+                }
+                if video_guid:
+                    metadata["video_guid"] = video_guid
+                self._finalise_recording_start(player, metadata)
+                message = "recording active (controller)"
+                log.info("%s controller indicates recording active", prefix)
+                return RecordingStartResult(True, True, recording_id, video_guid, message)
+
             message = "timeout waiting for recording confirmation"
             log.error("%s %s", prefix, message)
             return RecordingStartResult(False, False, recording_id, video_guid, message)
@@ -1983,74 +2051,55 @@ class PupilBridge:
             return set()
 
         started: set[str] = set()
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        session_value = self._auto_session
+        block_value = self._auto_block
         for player in target_players:
-            self.start_recording(self._auto_session, self._auto_block, player)
-            if self._active_recording.get(player):
+            session_part = str(session_value) if session_value is not None else "-"
+            block_part = str(block_value) if block_value is not None else "-"
+            label = "|".join(["game", session_part, block_part, player, timestamp])
+            result = self.start_recording(player=player, label=label)
+            if result.ok and result.is_recording_active:
+                metadata = self._recording_metadata.get(player)
+                if isinstance(metadata, dict):
+                    if session_value is not None:
+                        metadata.setdefault("session", session_value)
+                    if block_value is not None:
+                        metadata.setdefault("block", block_value)
                 started.add(player)
         return started
 
-    def start_recording(self, session: int, block: int, player: str) -> None:
-        """Start a recording for the given player using the agreed label schema."""
+    def _start_recording_legacy(self, session: int, block: int, player: str) -> None:
+        """Deprecated – do not use; kept for reference."""
 
-        device = self._device_by_player.get(player)
-        if device is None:
-            log.info("recording.start übersprungen (%s nicht verbunden)", player)
-            return
-
-        if self._active_recording.get(player):
-            log.debug("Recording already active for %s", player)
-            return
-
-        vp_index = self._PLAYER_INDICES.get(player, 0)
-        recording_label = f"{session}.{block}.{vp_index}"
-
-        controller = self._recording_controllers.get(player)
-        if controller is None:
-            cfg = self._device_config.get(player)
-            if cfg is None:
-                log.info("recording.start übersprungen (%s ohne Konfig)", player)
-                return
-            controller = self._build_recording_controller(player, device, cfg)
-            self._recording_controllers[player] = controller
-
-        log.info(
-            "recording start requested player=%s label=%s session=%s block=%s",
-            player,
-            recording_label,
-            session,
-            block,
+        prefix = self._player_log_prefix(player)
+        log.warning(
+            "%s legacy start_recording(session, block, player) is deprecated",
+            prefix,
         )
-
-        future = self._schedule_recording_start(player, controller, recording_label)
-        try:
-            future.result(timeout=max(1.0, self._connect_timeout))
-        except RecordingHttpError as exc:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        label = "|".join([
+            "game",
+            str(session),
+            str(block),
+            player,
+            timestamp,
+        ])
+        result = self.start_recording(player=player, label=label)
+        if not result.ok or not result.is_recording_active:
             log.warning(
-                "recording start failed player=%s status=%s msg=%s",
-                player,
-                exc.status,
-                exc.message,
+                "%s legacy start failed session=%s block=%s msg=%s",
+                prefix,
+                session,
+                block,
+                result.message,
             )
-            return
-        except asyncio.TimeoutError:
-            log.warning("recording start timeout player=%s", player)
-            return
-        except Exception as exc:  # pragma: no cover - defensive
-            log.warning("recording start error player=%s error=%s", player, exc)
-            return
 
-        metadata = {
-            "session": session,
-            "block": block,
-            "player": player,
-            "recording_label": recording_label,
-            "recording_id": None,
-        }
-        self._finalise_recording_start(
-            player,
-            metadata,
-            send_session_event=True,
-        )
+        metadata = self._recording_metadata.get(player)
+        if isinstance(metadata, dict):
+            metadata.setdefault("session", session)
+            metadata.setdefault("block", block)
+            metadata.setdefault("recording_label", label)
 
     def start_external_recording(
         self, player: str, label: Optional[str] = None
